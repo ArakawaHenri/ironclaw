@@ -9,6 +9,7 @@
 
 pub mod builder;
 pub mod builtin;
+pub mod idempotency;
 pub mod mcp;
 pub mod rate_limiter;
 pub mod schema_validator;

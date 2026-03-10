@@ -29,6 +29,7 @@ use crate::llm::LlmProvider;
 use crate::safety::SafetyLayer;
 use crate::skills::SkillRegistry;
 use crate::tools::ToolRegistry;
+use crate::tools::idempotency::ToolIdempotencyCache;
 use crate::workspace::Workspace;
 
 /// Collapse a tool output string into a single-line preview for display.
@@ -81,6 +82,8 @@ pub struct AgentDeps {
     pub transcription: Option<Arc<crate::transcription::TranscriptionMiddleware>>,
     /// Document text extraction middleware for PDF, DOCX, PPTX, etc.
     pub document_extraction: Option<Arc<crate::document_extraction::DocumentExtractionMiddleware>>,
+    /// Idempotency cache for tool executions.
+    pub idempotency_cache: ToolIdempotencyCache,
 }
 
 /// The main agent that coordinates all components.
@@ -130,6 +133,7 @@ impl Agent {
             deps.tools.clone(),
             deps.store.clone(),
             deps.hooks.clone(),
+            deps.idempotency_cache.clone(),
         );
         if let Some(ref tx) = deps.sse_tx {
             scheduler.set_sse_sender(tx.clone());

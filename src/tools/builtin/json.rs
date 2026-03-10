@@ -132,6 +132,10 @@ impl Tool for JsonTool {
     fn requires_sanitization(&self) -> bool {
         false // Internal tool, no external data
     }
+
+    fn is_idempotent(&self) -> bool {
+        true
+    }
 }
 
 fn parse_json_input(data: &serde_json::Value) -> Result<serde_json::Value, ToolError> {

@@ -312,6 +312,17 @@ pub trait Tool: Send + Sync {
         &[]
     }
 
+    /// Whether this tool produces the same output for the same input.
+    ///
+    /// Idempotent tools (read-only, pure functions) can have their results cached
+    /// to avoid re-execution when the LLM re-requests the same tool with identical
+    /// arguments (common during self-repair recovery or retry loops).
+    ///
+    /// Default: `false`. Override to return `true` for read-only tools.
+    fn is_idempotent(&self) -> bool {
+        false
+    }
+
     /// Per-invocation rate limit for this tool.
     ///
     /// Return `Some(config)` to throttle how often this tool can be called per user.

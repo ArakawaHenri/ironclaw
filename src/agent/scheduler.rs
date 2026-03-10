@@ -18,6 +18,7 @@ use crate::error::{Error, JobError};
 use crate::hooks::HookRegistry;
 use crate::llm::LlmProvider;
 use crate::safety::SafetyLayer;
+use crate::tools::idempotency::ToolIdempotencyCache;
 use crate::tools::{ApprovalContext, ToolRegistry};
 
 /// Message to send to a worker.
@@ -58,6 +59,8 @@ pub struct Scheduler {
     sse_tx: Option<tokio::sync::broadcast::Sender<SseEvent>>,
     /// HTTP interceptor for trace recording/replay (propagated to workers).
     http_interceptor: Option<Arc<dyn crate::llm::recording::HttpInterceptor>>,
+    /// Idempotency cache for tool executions (shared across all workers).
+    idempotency_cache: ToolIdempotencyCache,
     /// Running jobs (main LLM-driven jobs).
     jobs: Arc<RwLock<HashMap<Uuid, ScheduledJob>>>,
     /// Running sub-tasks (tool executions, background tasks).
@@ -66,6 +69,7 @@ pub struct Scheduler {
 
 impl Scheduler {
     /// Create a new scheduler.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: AgentConfig,
         context_manager: Arc<ContextManager>,
@@ -74,6 +78,7 @@ impl Scheduler {
         tools: Arc<ToolRegistry>,
         store: Option<Arc<dyn Database>>,
         hooks: Arc<HookRegistry>,
+        idempotency_cache: ToolIdempotencyCache,
     ) -> Self {
         Self {
             config,
@@ -85,6 +90,7 @@ impl Scheduler {
             hooks,
             sse_tx: None,
             http_interceptor: None,
+            idempotency_cache,
             jobs: Arc::new(RwLock::new(HashMap::new())),
             subtasks: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -254,6 +260,7 @@ impl Scheduler {
                 sse_tx: self.sse_tx.clone(),
                 approval_context,
                 http_interceptor: self.http_interceptor.clone(),
+                idempotency_cache: self.idempotency_cache.clone(),
             };
             let worker = Worker::new(job_id, deps);
 

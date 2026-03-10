@@ -453,6 +453,9 @@ impl TestHarnessBuilder {
             http_interceptor: None,
             transcription: None,
             document_extraction: None,
+            idempotency_cache: crate::tools::idempotency::ToolIdempotencyCache::new(
+                crate::tools::idempotency::IdempotencyCacheConfig::default(),
+            ),
         };
 
         TestHarness {

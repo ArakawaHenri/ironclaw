@@ -15,6 +15,7 @@ use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
 use crate::error::Error;
 use crate::llm::{ChatMessage, Reasoning, ReasoningContext, RespondResult};
+use crate::tools::idempotency::ToolIdempotencyCache;
 use crate::tools::redact_params;
 
 /// Result of the agentic loop execution.
@@ -569,6 +570,7 @@ impl Agent {
                             let pf_idx = *pf_idx;
                             let tools = self.tools().clone();
                             let safety = self.safety().clone();
+                            let idempotency_cache = self.deps.idempotency_cache.clone();
                             let channels = self.channels.clone();
                             let job_ctx = job_ctx.clone();
                             let tc = tc.clone();
@@ -589,6 +591,7 @@ impl Agent {
                                 let result = execute_chat_tool_standalone(
                                     &tools,
                                     &safety,
+                                    &idempotency_cache,
                                     &tc.name,
                                     &tc.arguments,
                                     &job_ctx,
@@ -859,7 +862,15 @@ impl Agent {
         params: &serde_json::Value,
         job_ctx: &JobContext,
     ) -> Result<String, Error> {
-        execute_chat_tool_standalone(self.tools(), self.safety(), tool_name, params, job_ctx).await
+        execute_chat_tool_standalone(
+            self.tools(),
+            self.safety(),
+            &self.deps.idempotency_cache,
+            tool_name,
+            params,
+            job_ctx,
+        )
+        .await
     }
 }
 
@@ -868,9 +879,11 @@ impl Agent {
 /// This standalone function enables parallel invocation from spawned JoinSet
 /// tasks, which cannot borrow `&self`. It replicates the logic from
 /// `Agent::execute_chat_tool`.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_chat_tool_standalone(
     tools: &crate::tools::ToolRegistry,
     safety: &crate::safety::SafetyLayer,
+    idempotency_cache: &ToolIdempotencyCache,
     tool_name: &str,
     params: &serde_json::Value,
     job_ctx: &crate::context::JobContext,
@@ -881,6 +894,15 @@ pub(super) async fn execute_chat_tool_standalone(
         .ok_or_else(|| crate::error::ToolError::NotFound {
             name: tool_name.to_string(),
         })?;
+
+    // Check idempotency cache
+    let job_id_str = job_ctx.job_id.to_string();
+    if tool.is_idempotent()
+        && let Some(cached) = idempotency_cache.get(&job_id_str, tool_name, params).await
+    {
+        tracing::debug!(tool = %tool_name, "Idempotency cache hit (chat)");
+        return Ok(cached);
+    }
 
     // Validate tool parameters
     let validation = safety.validator().validate_tool_params(params);
@@ -953,13 +975,25 @@ pub(super) async fn execute_chat_tool_standalone(
             reason: e.to_string(),
         })?;
 
-    serde_json::to_string_pretty(&result.result).map_err(|e| {
-        crate::error::ToolError::ExecutionFailed {
-            name: tool_name.to_string(),
-            reason: format!("Failed to serialize result: {}", e),
-        }
-        .into()
-    })
+    let result_str: Result<String, Error> =
+        serde_json::to_string_pretty(&result.result).map_err(|e| {
+            crate::error::ToolError::ExecutionFailed {
+                name: tool_name.to_string(),
+                reason: format!("Failed to serialize result: {}", e),
+            }
+            .into()
+        });
+
+    // Cache successful results for idempotent tools
+    if let Ok(ref output_str) = result_str
+        && tool.is_idempotent()
+    {
+        idempotency_cache
+            .put(&job_id_str, tool_name, params, output_str.clone())
+            .await;
+    }
+
+    result_str
 }
 
 /// Parsed auth result fields for emitting StatusUpdate::AuthRequired.
@@ -1187,6 +1221,9 @@ mod tests {
             http_interceptor: None,
             transcription: None,
             document_extraction: None,
+            idempotency_cache: crate::tools::idempotency::ToolIdempotencyCache::new(
+                crate::tools::idempotency::IdempotencyCacheConfig::default(),
+            ),
         };
 
         Agent::new(
@@ -1520,9 +1557,13 @@ mod tests {
 
         let job_ctx = JobContext::with_user("test", "chat", "test session");
 
+        let cache = crate::tools::idempotency::ToolIdempotencyCache::new(
+            crate::tools::idempotency::IdempotencyCacheConfig::default(),
+        );
         let result = super::execute_chat_tool_standalone(
             &registry,
             &safety,
+            &cache,
             "echo",
             &serde_json::json!({"message": "hello"}),
             &job_ctx,
@@ -1548,9 +1589,13 @@ mod tests {
         });
         let job_ctx = JobContext::with_user("test", "chat", "test session");
 
+        let cache = crate::tools::idempotency::ToolIdempotencyCache::new(
+            crate::tools::idempotency::IdempotencyCacheConfig::default(),
+        );
         let result = super::execute_chat_tool_standalone(
             &registry,
             &safety,
+            &cache,
             "nonexistent",
             &serde_json::json!({}),
             &job_ctx,
@@ -2026,6 +2071,9 @@ mod tests {
             http_interceptor: None,
             transcription: None,
             document_extraction: None,
+            idempotency_cache: crate::tools::idempotency::ToolIdempotencyCache::new(
+                crate::tools::idempotency::IdempotencyCacheConfig::default(),
+            ),
         };
 
         Agent::new(
@@ -2143,6 +2191,9 @@ mod tests {
                 http_interceptor: None,
                 transcription: None,
                 document_extraction: None,
+                idempotency_cache: crate::tools::idempotency::ToolIdempotencyCache::new(
+                    crate::tools::idempotency::IdempotencyCacheConfig::default(),
+                ),
             };
 
             Agent::new(

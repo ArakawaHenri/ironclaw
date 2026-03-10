@@ -959,6 +959,7 @@ impl Agent {
                 for (spawn_idx, tc) in runnable.iter().enumerate() {
                     let tools = self.tools().clone();
                     let safety = self.safety().clone();
+                    let idempotency_cache = self.deps.idempotency_cache.clone();
                     let channels = self.channels.clone();
                     let job_ctx = job_ctx.clone();
                     let tc = tc.clone();
@@ -979,6 +980,7 @@ impl Agent {
                         let result = execute_chat_tool_standalone(
                             &tools,
                             &safety,
+                            &idempotency_cache,
                             &tc.name,
                             &tc.arguments,
                             &job_ctx,

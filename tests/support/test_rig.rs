@@ -624,6 +624,9 @@ impl TestRigBuilder {
             },
             transcription: None,
             document_extraction: None,
+            idempotency_cache: ironclaw::tools::idempotency::ToolIdempotencyCache::new(
+                ironclaw::tools::idempotency::IdempotencyCacheConfig::default(),
+            ),
         };
 
         // 7. Create TestChannel and ChannelManager.

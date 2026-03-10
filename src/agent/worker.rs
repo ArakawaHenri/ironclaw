@@ -19,6 +19,7 @@ use crate::llm::{
     ToolSelection,
 };
 use crate::safety::SafetyLayer;
+use crate::tools::idempotency::ToolIdempotencyCache;
 use crate::tools::rate_limiter::RateLimitResult;
 use crate::tools::{ApprovalContext, ToolRegistry, redact_params};
 
@@ -44,6 +45,8 @@ pub struct WorkerDeps {
     pub approval_context: Option<ApprovalContext>,
     /// HTTP interceptor for trace recording/replay (propagated to JobContext).
     pub http_interceptor: Option<Arc<dyn crate::llm::recording::HttpInterceptor>>,
+    /// Idempotency cache for tool executions.
+    pub idempotency_cache: ToolIdempotencyCache,
 }
 
 /// Worker that executes a single job.
@@ -284,6 +287,12 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 self.mark_stuck("Execution timeout").await?;
             }
         }
+
+        // Clean up idempotency cache entries for this job
+        self.deps
+            .idempotency_cache
+            .invalidate_job(&self.job_id.to_string())
+            .await;
 
         Ok(())
     }
@@ -737,6 +746,22 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     name: tool_name.to_string(),
                 })?;
 
+        // Check idempotency cache before any expensive work
+        let job_id_str = job_id.to_string();
+        if tool.is_idempotent()
+            && let Some(cached) = deps
+                .idempotency_cache
+                .get(&job_id_str, tool_name, params)
+                .await
+        {
+            tracing::debug!(
+                tool = %tool_name,
+                job = %job_id,
+                "Idempotency cache hit"
+            );
+            return Ok(cached);
+        }
+
         // Check approval: use context-aware check if available, else block all non-Never tools
         let requirement = tool.requires_approval(params);
         let blocked =
@@ -967,13 +992,25 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             })?;
 
         // Return result as string
-        serde_json::to_string_pretty(&output.result).map_err(|e| {
-            crate::error::ToolError::ExecutionFailed {
-                name: tool_name.to_string(),
-                reason: format!("Failed to serialize result: {}", e),
-            }
-            .into()
-        })
+        let result_str: Result<String, Error> = serde_json::to_string_pretty(&output.result)
+            .map_err(|e| {
+                crate::error::ToolError::ExecutionFailed {
+                    name: tool_name.to_string(),
+                    reason: format!("Failed to serialize result: {}", e),
+                }
+                .into()
+            });
+
+        // Cache successful results for idempotent tools
+        if let Ok(ref output_str) = result_str
+            && tool.is_idempotent()
+        {
+            deps.idempotency_cache
+                .put(&job_id_str, tool_name, &params, output_str.clone())
+                .await;
+        }
+
+        result_str
     }
 
     /// Process a tool execution result and add it to the reasoning context.
@@ -1386,6 +1423,9 @@ mod tests {
             sse_tx: None,
             approval_context: None,
             http_interceptor: None,
+            idempotency_cache: crate::tools::idempotency::ToolIdempotencyCache::new(
+                crate::tools::idempotency::IdempotencyCacheConfig::default(),
+            ),
         };
 
         Worker::new(job_id, deps)
@@ -1648,6 +1688,9 @@ mod tests {
             sse_tx: None,
             approval_context,
             http_interceptor: None,
+            idempotency_cache: crate::tools::idempotency::ToolIdempotencyCache::new(
+                crate::tools::idempotency::IdempotencyCacheConfig::default(),
+            ),
         };
 
         Worker::new(job_id, deps)
