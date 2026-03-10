@@ -3,7 +3,7 @@ unmaintained = "workspace"
 yanked = "deny"
 ignore = [
     # Pre-existing advisories — tracked for upgrade in separate PRs
-    # serde_yml unsound/unmaintained — transitive dep, no direct usage
+    # serde_yml unsound/unmaintained — direct dep, upgrade tracked separately
     "RUSTSEC-2025-0068",
     # tokio-tar PAX header parsing — sandbox containers only
     "RUSTSEC-2025-0111",
