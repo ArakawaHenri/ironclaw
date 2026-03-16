@@ -64,6 +64,7 @@ pub struct ExtensionManager {
     // MCP infrastructure
     mcp_session_manager: Arc<McpSessionManager>,
     mcp_process_manager: Arc<crate::tools::mcp::process::McpProcessManager>,
+    nearai_session_manager: Option<Arc<crate::llm::SessionManager>>,
     /// Active MCP clients keyed by server name.
     mcp_clients: RwLock<HashMap<String, Arc<McpClient>>>,
 
@@ -87,6 +88,8 @@ pub struct ExtensionManager {
     user_id: String,
     /// Optional database store for DB-backed MCP config.
     store: Option<Arc<dyn crate::db::Database>>,
+    /// Companion MCP server derived from the active provider config.
+    companion_mcp_server: Option<McpServerConfig>,
     /// Names of WASM channels that were successfully loaded at startup.
     active_channel_names: RwLock<HashSet<String>>,
     /// Installed channel-relay extensions (no on-disk artifact, tracked in memory).
@@ -147,6 +150,7 @@ impl ExtensionManager {
     pub fn new(
         mcp_session_manager: Arc<McpSessionManager>,
         mcp_process_manager: Arc<crate::tools::mcp::process::McpProcessManager>,
+        nearai_session_manager: Option<Arc<crate::llm::SessionManager>>,
         secrets: Arc<dyn SecretsStore + Send + Sync>,
         tool_registry: Arc<ToolRegistry>,
         hooks: Option<Arc<HookRegistry>>,
@@ -156,6 +160,7 @@ impl ExtensionManager {
         tunnel_url: Option<String>,
         user_id: String,
         store: Option<Arc<dyn crate::db::Database>>,
+        companion_mcp_server: Option<McpServerConfig>,
         catalog_entries: Vec<RegistryEntry>,
     ) -> Self {
         let registry = if catalog_entries.is_empty() {
@@ -168,6 +173,7 @@ impl ExtensionManager {
             discovery: OnlineDiscovery::new(),
             mcp_session_manager,
             mcp_process_manager,
+            nearai_session_manager,
             mcp_clients: RwLock::new(HashMap::new()),
             wasm_tool_runtime,
             wasm_tools_dir,
@@ -181,6 +187,7 @@ impl ExtensionManager {
             tunnel_url,
             user_id,
             store,
+            companion_mcp_server,
             active_channel_names: RwLock::new(HashSet::new()),
             installed_relay_extensions: RwLock::new(HashSet::new()),
             activation_errors: RwLock::new(HashMap::new()),
@@ -1257,11 +1264,18 @@ impl ExtensionManager {
         &self,
     ) -> Result<crate::tools::mcp::config::McpServersFile, crate::tools::mcp::config::ConfigError>
     {
-        if let Some(ref store) = self.store {
-            crate::tools::mcp::config::load_mcp_servers_from_db(store.as_ref(), &self.user_id).await
+        let mut servers = if let Some(ref store) = self.store {
+            crate::tools::mcp::config::load_mcp_servers_from_db(store.as_ref(), &self.user_id)
+                .await?
         } else {
-            crate::tools::mcp::config::load_mcp_servers().await
+            crate::tools::mcp::config::load_mcp_servers().await?
+        };
+
+        if let Some(ref companion) = self.companion_mcp_server {
+            servers.upsert(companion.clone());
         }
+
+        Ok(servers)
     }
 
     async fn get_mcp_server(
@@ -2854,6 +2868,8 @@ impl ExtensionManager {
         let client = crate::tools::mcp::create_client_from_config(
             server.clone(),
             &self.mcp_session_manager,
+            self.nearai_session_manager.clone(),
+            None,
             &self.mcp_process_manager,
             Some(Arc::clone(&self.secrets)),
             &self.user_id,
@@ -4595,6 +4611,7 @@ mod tests {
         crate::extensions::manager::ExtensionManager::new(
             mcp,
             Arc::new(McpProcessManager::new()),
+            None,
             secrets,
             tools,
             None, // hooks
@@ -4604,6 +4621,7 @@ mod tests {
             None, // tunnel_url
             "test".to_string(),
             None, // db
+            None, // companion MCP
             vec![],
         )
     }
@@ -4774,6 +4792,7 @@ mod tests {
         ExtensionManager::new(
             Arc::new(McpSessionManager::new()),
             Arc::new(McpProcessManager::new()),
+            None,
             Arc::new(InMemorySecretsStore::new(crypto)),
             Arc::new(ToolRegistry::new()),
             None,
@@ -4782,6 +4801,7 @@ mod tests {
             channels_dir,
             None,
             "test".to_string(),
+            None,
             None,
             Vec::new(),
         )
@@ -5344,6 +5364,7 @@ mod tests {
         ExtensionManager::new(
             mcp,
             Arc::new(McpProcessManager::new()),
+            None,
             secrets,
             tools,
             None,
@@ -5352,6 +5373,7 @@ mod tests {
             dir,
             tunnel_url,
             "test".to_string(),
+            None,
             None,
             vec![],
         )

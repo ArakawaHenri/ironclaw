@@ -493,7 +493,22 @@ async fn test_server(name: String, user_id: String) -> anyhow::Result<()> {
     let secrets = get_secrets_store().await?;
     let has_tokens = is_authenticated(&server, &secrets, &user_id).await;
 
-    let client = if has_tokens {
+    let client = if server.uses_runtime_auth_source() {
+        let process_manager = Arc::new(McpProcessManager::new());
+        let config = crate::config::Config::from_env().await?;
+        let nearai_session = crate::llm::create_session_manager(config.llm.session.clone()).await;
+        create_client_from_config(
+            server.clone(),
+            &session_manager,
+            Some(nearai_session),
+            config.llm.nearai.api_key.clone(),
+            &process_manager,
+            None,
+            "default",
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?
+    } else if has_tokens {
         // We have stored tokens, use authenticated client
         McpClient::new_authenticated(server.clone(), session_manager.clone(), secrets, user_id)
     } else if server.requires_auth() {
@@ -508,9 +523,13 @@ async fn test_server(name: String, user_id: String) -> anyhow::Result<()> {
     } else {
         // Use the factory to dispatch on transport type (HTTP, stdio, unix)
         let process_manager = Arc::new(McpProcessManager::new());
+        let config = crate::config::Config::from_env().await?;
+        let nearai_session = crate::llm::create_session_manager(config.llm.session.clone()).await;
         create_client_from_config(
             server.clone(),
             &session_manager,
+            Some(nearai_session),
+            config.llm.nearai.api_key.clone(),
             &process_manager,
             None,
             "default",

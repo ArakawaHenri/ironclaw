@@ -27,6 +27,8 @@ pub enum McpFactoryError {
 pub async fn create_client_from_config(
     server: McpServerConfig,
     session_manager: &Arc<McpSessionManager>,
+    nearai_session_manager: Option<Arc<crate::llm::SessionManager>>,
+    nearai_api_key: Option<secrecy::SecretString>,
     process_manager: &Arc<McpProcessManager>,
     secrets: Option<Arc<dyn SecretsStore + Send + Sync>>,
     user_id: &str,
@@ -78,6 +80,17 @@ pub async fn create_client_from_config(
             Err(McpFactoryError::UnixNotSupported { name: server_name })
         }
         EffectiveTransport::Http => {
+            if server.uses_runtime_auth_source() {
+                return Ok(McpClient::new_with_config(server)
+                    .with_nearai_session_manager(
+                        nearai_session_manager.expect(
+                            "NearAI companion MCP servers require a NearAI session manager",
+                        ),
+                    )
+                    .with_nearai_api_key(nearai_api_key)
+                    .with_session_manager(Arc::clone(session_manager)));
+            }
+
             if let Some(ref secrets) = secrets {
                 let has_tokens =
                     crate::tools::mcp::is_authenticated(&server, secrets, user_id).await;
@@ -122,6 +135,8 @@ mod tests {
         let client = create_client_from_config(
             server,
             &session_manager,
+            None,
+            None,
             &process_manager,
             None,
             "test-user",

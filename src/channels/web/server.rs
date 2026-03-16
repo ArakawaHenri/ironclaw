@@ -3365,6 +3365,7 @@ mod tests {
         let ext_mgr = Arc::new(ExtensionManager::new(
             mcp_sm,
             mcp_pm,
+            None,
             secrets,
             tool_registry,
             None,
@@ -3373,6 +3374,7 @@ mod tests {
             wasm_channels_dir.path().to_path_buf(),
             None,
             "test".to_string(),
+            None,
             None,
             vec![],
         ));

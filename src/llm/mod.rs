@@ -16,6 +16,7 @@ pub mod config;
 pub mod costs;
 pub mod error;
 pub mod failover;
+pub mod nearai_auth;
 mod nearai_chat;
 pub mod oauth_helpers;
 mod provider;
@@ -40,6 +41,7 @@ pub use config::{
 };
 pub use error::LlmError;
 pub use failover::{CooldownConfig, FailoverProvider};
+pub use nearai_auth::resolve_nearai_bearer_token;
 pub use nearai_chat::{ModelInfo, NearAiChatProvider};
 pub use provider::{
     ChatMessage, CompletionRequest, CompletionResponse, ContentPart, FinishReason, ImageUrl,
