@@ -523,13 +523,12 @@ impl McpClient {
             )));
         }
 
-        response
+        let raw_result = response
             .result
-            .ok_or_else(|| ToolError::ExternalService("No result in MCP response".to_string()))
-            .and_then(|r| {
-                serde_json::from_value(r)
-                    .map_err(|e| ToolError::ExternalService(format!("Invalid tool result: {}", e)))
-            })
+            .ok_or_else(|| ToolError::ExternalService("No result in MCP response".to_string()))?;
+
+        serde_json::from_value(raw_result)
+            .map_err(|e| ToolError::ExternalService(format!("Invalid tool result: {}", e)))
     }
 
     /// Clear the tools cache.
@@ -674,56 +673,15 @@ fn normalize_mcp_tool_arguments(tool_name: &str, value: serde_json::Value) -> se
         return value;
     }
 
-    // This is intentionally a minimal last-mile cleanup for the current
-    // provider-backed web_search MCP flow. It strips the most common obviously
-    // bad values we observed from model output, but it is not a substitute for
-    // stricter tool schema constraints or provider-specific validation.
     let serde_json::Value::Object(mut map) = value else {
         return value;
     };
 
-    for key in ["goggles", "result_filter"] {
-        if map
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|s| s.trim().is_empty())
-        {
-            map.remove(key);
-        }
-    }
-
-    if let Some(country) = map
-        .get("country")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        map.insert(
-            "country".to_string(),
-            serde_json::Value::String(country.to_ascii_uppercase()),
-        );
-    }
-
-    if let Some(ui_lang) = map
-        .get("ui_lang")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        && (ui_lang.is_empty() || !ui_lang.contains('-'))
-    {
-        map.remove("ui_lang");
-    }
-
-    if let Some(freshness) = map
-        .get("freshness")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-    {
-        let valid =
-            matches!(freshness, "pd" | "pw" | "pm" | "py") || freshness.split_once("to").is_some();
-        if freshness.is_empty() || !valid {
-            map.remove("freshness");
-        }
-    }
+    // Keep this intentionally narrow: only strip optional fields that the
+    // model frequently emits as empty strings. Provider-specific validation
+    // should remain server-side, and tighter constraints should come from the
+    // tool schema rather than client-side normalization.
+    map.retain(|_, value| !value.as_str().is_some_and(|s| s.trim().is_empty()));
 
     serde_json::Value::Object(map)
 }
@@ -1425,27 +1383,19 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_web_search_arguments_uppercases_country_and_drops_short_ui_lang() {
+    fn test_normalize_web_search_arguments_strips_any_empty_string_field() {
         let input = serde_json::json!({
-            "country": "us",
-            "ui_lang": "en"
+            "query": "Rust MCP server example",
+            "goggles": "",
+            "freshness": "   ",
+            "country": "US"
         });
 
         let result = normalize_mcp_tool_arguments("web_search", input);
         let obj = result.as_object().unwrap();
         assert_eq!(obj["country"], "US");
-        assert!(!obj.contains_key("ui_lang"));
-    }
-
-    #[test]
-    fn test_normalize_web_search_arguments_drops_invalid_freshness() {
-        let input = serde_json::json!({
-            "freshness": "365d"
-        });
-
-        let result = normalize_mcp_tool_arguments("web_search", input);
-        let obj = result.as_object().unwrap();
         assert!(!obj.contains_key("freshness"));
+        assert!(!obj.contains_key("goggles"));
     }
 
     #[test]
