@@ -43,8 +43,8 @@ use crate::error::ToolError as AgentToolError;
 use crate::llm::{
     ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult, ToolDefinition,
 };
-use crate::tools::ToolRegistry;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput};
+use crate::tools::{ToolRegistry, prepare_tool_params};
 
 /// Requirement specification for building software.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -509,7 +509,8 @@ Create alongside the .wasm file to grant capabilities:
         let mut iteration = 0;
 
         // Create reasoning engine
-        let reasoning = Reasoning::new(self.llm.clone());
+        let reasoning =
+            Reasoning::new(self.llm.clone()).with_model_name(self.llm.active_model_name());
 
         // Build initial context
         let tool_defs = self.get_build_tools().await;
@@ -775,10 +776,11 @@ Create alongside the .wasm file to grant capabilities:
             self.tools.get(tool_name).await.ok_or_else(|| {
                 ToolError::ExecutionFailed(format!("Tool not found: {}", tool_name))
             })?;
+        let normalized_params = prepare_tool_params(tool.as_ref(), params);
 
         // Execute with a dummy context (build tools don't need job context)
         let ctx = JobContext::default();
-        tool.execute(params.clone(), &ctx).await
+        tool.execute(normalized_params, &ctx).await
     }
 
     /// Find the build artifact based on project type.
@@ -810,7 +812,8 @@ Create alongside the .wasm file to grant capabilities:
 impl SoftwareBuilder for LlmSoftwareBuilder {
     async fn analyze(&self, description: &str) -> Result<BuildRequirement, AgentToolError> {
         // Use LLM to parse the description
-        let reasoning = Reasoning::new(self.llm.clone());
+        let reasoning =
+            Reasoning::new(self.llm.clone()).with_model_name(self.llm.active_model_name());
 
         let prompt = format!(
             r#"Analyze this software requirement and extract structured information.

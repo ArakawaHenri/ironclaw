@@ -23,7 +23,7 @@ use crate::tools::builtin::{
     ToolUpgradeTool, WriteFileTool,
 };
 use crate::tools::rate_limiter::RateLimiter;
-use crate::tools::tool::{Tool, ToolDomain};
+use crate::tools::tool::{ApprovalRequirement, Tool, ToolDomain};
 use crate::tools::wasm::{
     Capabilities, OAuthRefreshConfig, ResourceLimits, SharedCredentialRegistry, WasmError,
     WasmStorageError, WasmToolRuntime, WasmToolStore, WasmToolWrapper,
@@ -64,6 +64,7 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "routine_delete",
     "routine_fire",
     "routine_history",
+    "event_emit",
     "skill_list",
     "skill_search",
     "skill_install",
@@ -74,6 +75,7 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "image_generate",
     "image_edit",
     "image_analyze",
+    "tool_info",
 ];
 
 /// Registry of available tools.
@@ -136,7 +138,7 @@ impl ToolRegistry {
             return;
         }
         self.tools.write().await.insert(name.clone(), tool);
-        tracing::debug!("Registered tool: {}", name);
+        tracing::trace!("Registered tool: {}", name);
     }
 
     /// Register a tool (sync version for startup, marks as built-in).
@@ -241,7 +243,18 @@ impl ToolRegistry {
         }
         self.register_sync(Arc::new(http));
 
-        tracing::info!("Registered {} built-in tools", self.count());
+        tracing::debug!("Registered {} built-in tools", self.count());
+    }
+
+    /// Register the `tool_info` discovery tool.
+    ///
+    /// Requires `Arc<Self>` so the tool can query the registry for other tools'
+    /// schemas at runtime. Call after `register_builtin_tools()`.
+    pub fn register_tool_info(self: &Arc<Self>) {
+        use crate::tools::builtin::ToolInfoTool;
+        let tool = ToolInfoTool::new(Arc::downgrade(self));
+        self.register_sync(Arc::new(tool));
+        tracing::debug!("Registered tool_info discovery tool");
     }
 
     /// Register only orchestrator-domain tools (safe for the main process).
@@ -277,6 +290,38 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Get tool definitions excluding specific tools by name.
+    ///
+    /// Used by lightweight routines to filter out denylisted and approval-gated tools
+    /// so the LLM only sees tools it is actually allowed to call.
+    pub async fn tool_definitions_excluding(&self, deny: &[&str]) -> Vec<ToolDefinition> {
+        let empty_params = serde_json::Value::Object(serde_json::Map::new());
+        let mut defs: Vec<ToolDefinition> = self
+            .tools
+            .read()
+            .await
+            .values()
+            .filter(|tool| {
+                // Exclude denylisted tools
+                if deny.contains(&tool.name()) {
+                    return false;
+                }
+                // Exclude tools that require approval
+                matches!(
+                    tool.requires_approval(&empty_params),
+                    ApprovalRequirement::Never
+                )
+            })
+            .map(|tool| ToolDefinition {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                parameters: tool.parameters_schema(),
+            })
+            .collect();
+        defs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        defs
+    }
+
     /// Register development tools for building software.
     ///
     /// These tools provide shell access, file operations, and code editing
@@ -289,7 +334,7 @@ impl ToolRegistry {
         self.register_sync(Arc::new(ListDirTool::new()));
         self.register_sync(Arc::new(ApplyPatchTool::new()));
 
-        tracing::info!("Registered 5 development tools");
+        tracing::debug!("Registered 5 development tools");
     }
 
     /// Register memory tools with a workspace.
@@ -302,7 +347,7 @@ impl ToolRegistry {
         self.register_sync(Arc::new(MemoryReadTool::new(Arc::clone(&workspace))));
         self.register_sync(Arc::new(MemoryTreeTool::new(workspace)));
 
-        tracing::info!("Registered 4 memory tools");
+        tracing::debug!("Registered 4 memory tools");
     }
 
     /// Register job management tools.
@@ -364,7 +409,7 @@ impl ToolRegistry {
             job_tool_count += 1;
         }
 
-        tracing::info!("Registered {} job management tools", job_tool_count);
+        tracing::debug!("Registered {} job management tools", job_tool_count);
     }
 
     /// Register secret management tools (list, delete).
@@ -378,7 +423,7 @@ impl ToolRegistry {
         use crate::tools::builtin::{SecretDeleteTool, SecretListTool};
         self.register_sync(Arc::new(SecretListTool::new(Arc::clone(&store))));
         self.register_sync(Arc::new(SecretDeleteTool::new(store)));
-        tracing::info!("Registered 2 secret management tools (list, delete)");
+        tracing::debug!("Registered 2 secret management tools (list, delete)");
     }
 
     /// Register extension management tools (search, install, auth, activate, list, remove).
@@ -393,7 +438,7 @@ impl ToolRegistry {
         self.register_sync(Arc::new(ToolRemoveTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ToolUpgradeTool::new(Arc::clone(&manager))));
         self.register_sync(Arc::new(ExtensionInfoTool::new(manager)));
-        tracing::info!("Registered 8 extension management tools");
+        tracing::debug!("Registered 8 extension management tools");
     }
 
     /// Register skill management tools (list, search, install, remove).
@@ -414,7 +459,7 @@ impl ToolRegistry {
             Arc::clone(&catalog),
         )));
         self.register_sync(Arc::new(SkillRemoveTool::new(registry)));
-        tracing::info!("Registered 4 skill management tools");
+        tracing::debug!("Registered 4 skill management tools");
     }
 
     /// Register routine management tools.
@@ -427,8 +472,8 @@ impl ToolRegistry {
         engine: Arc<crate::agent::routine_engine::RoutineEngine>,
     ) {
         use crate::tools::builtin::{
-            RoutineCreateTool, RoutineDeleteTool, RoutineFireTool, RoutineHistoryTool,
-            RoutineListTool, RoutineUpdateTool,
+            EventEmitTool, RoutineCreateTool, RoutineDeleteTool, RoutineFireTool,
+            RoutineHistoryTool, RoutineListTool, RoutineUpdateTool,
         };
         self.register_sync(Arc::new(RoutineCreateTool::new(
             Arc::clone(&store),
@@ -448,16 +493,22 @@ impl ToolRegistry {
             Arc::clone(&engine),
         )));
         self.register_sync(Arc::new(RoutineHistoryTool::new(store)));
-        tracing::info!("Registered 6 routine management tools");
+        self.register_sync(Arc::new(EventEmitTool::new(engine)));
+        tracing::debug!("Registered 7 routine management tools");
     }
 
     /// Register message tool for sending messages to channels.
     pub async fn register_message_tools(
         &self,
         channel_manager: Arc<crate::channels::ChannelManager>,
+        extension_manager: Option<Arc<crate::extensions::ExtensionManager>>,
     ) {
         use crate::tools::builtin::MessageTool;
-        let tool = Arc::new(MessageTool::new(channel_manager));
+        let mut tool = MessageTool::new(channel_manager);
+        if let Some(extension_manager) = extension_manager {
+            tool = tool.with_extension_manager(extension_manager);
+        }
+        let tool = Arc::new(tool);
         *self.message_tool.write().await = Some(Arc::clone(&tool));
         self.tools
             .write()
@@ -467,7 +518,7 @@ impl ToolRegistry {
             .write()
             .await
             .insert("message".to_string());
-        tracing::info!("Registered message tool");
+        tracing::debug!("Registered message tool");
     }
 
     /// Set the default channel and target for the message tool.
@@ -501,7 +552,7 @@ impl ToolRegistry {
             gen_model,
             base_dir,
         )));
-        tracing::info!("Registered 2 image tools (generate, edit)");
+        tracing::debug!("Registered 2 image tools (generate, edit)");
     }
 
     /// Register vision/image analysis tools.
@@ -521,7 +572,7 @@ impl ToolRegistry {
             vision_model,
             base_dir,
         )));
-        tracing::info!("Registered 1 vision tool (analyze)");
+        tracing::debug!("Registered 1 vision tool (analyze)");
     }
 
     /// Register the software builder tool.
@@ -549,7 +600,7 @@ impl ToolRegistry {
         self.register(Arc::new(BuildSoftwareTool::new(builder)))
             .await;
 
-        tracing::info!("Registered software builder tool");
+        tracing::debug!("Registered software builder tool");
     }
 
     /// Register a WASM tool from bytes.
@@ -619,7 +670,7 @@ impl ToolRegistry {
             );
         }
 
-        tracing::info!(name = reg.name, "Registered WASM tool");
+        tracing::debug!(name = reg.name, "Registered WASM tool");
         Ok(())
     }
 
@@ -676,7 +727,7 @@ impl ToolRegistry {
         .await
         .map_err(WasmRegistrationError::Wasm)?;
 
-        tracing::info!(
+        tracing::debug!(
             name = tool_with_binary.tool.name,
             user_id = user_id,
             trust_level = %tool_with_binary.tool.trust_level,

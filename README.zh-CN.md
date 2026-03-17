@@ -16,7 +16,8 @@
 
 <p align="center">
   <a href="README.md">English</a> |
-  <a href="README.zh-CN.md">简体中文</a>
+  <a href="README.zh-CN.md">简体中文</a> |
+  <a href="README.ru.md">Русский</a>
 </p>
 
 <p align="center">
@@ -162,12 +163,17 @@ ironclaw onboard
 
 ### 替代 LLM 提供商
 
-IronClaw 默认使用 NEAR AI，但兼容任何 OpenAI 兼容的端点。
-常用选项包括 **OpenRouter**（300+ 模型）、**Together AI**、**Fireworks AI**、**Ollama**（本地部署）以及自托管服务器如 **vLLM** 或 **LiteLLM**。
+IronClaw 默认使用 NEAR AI，但开箱即用地支持多种 LLM 提供商。
+内置提供商包括 **Anthropic**、**OpenAI**、**Google Gemini**、**MiniMax**、**Mistral** 和 **Ollama**（本地部署）。同时也支持 OpenAI 兼容服务，如 **OpenRouter**（300+ 模型）、**Together AI**、**Fireworks AI** 以及自托管服务器（**vLLM**、**LiteLLM**）。
 
-在向导中选择 *"OpenAI-compatible"*，或直接设置环境变量：
+在向导中选择你的提供商，或直接设置环境变量：
 
 ```env
+# 示例：MiniMax（内置，204K 上下文）
+LLM_BACKEND=minimax
+MINIMAX_API_KEY=...
+
+# 示例：OpenAI 兼容端点
 LLM_BACKEND=openai_compatible
 LLM_BASE_URL=https://openrouter.ai/api/v1
 LLM_API_KEY=sk-or-...
@@ -229,7 +235,7 @@ WASM ──► 白名单  ──► 泄露扫描 ──► 凭据  ──► 执
 │                         │          │                           │
 │              ┌──────────▼────┐  ┌──▼───────────────┐           │
 │              │    调度器      │  │   定时任务引擎    │           │
-│              │  (并行任务)    │  │(cron, 事件, wh)  │           │
+│              │  (并行任务)    │  │(cron, 事件, Webhook)│          │
 │              └──────┬────────┘  └────────┬─────────┘           │
 │                     │                    │                     │
 │       ┌─────────────┼────────────────────┘                     │

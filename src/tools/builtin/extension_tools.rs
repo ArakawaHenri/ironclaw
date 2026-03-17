@@ -213,7 +213,7 @@ impl Tool for ToolAuthTool {
 
         let result = self
             .manager
-            .auth(name, None)
+            .auth(name)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
@@ -256,7 +256,13 @@ impl Tool for ToolAuthTool {
     }
 
     fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
-        ApprovalRequirement::UnlessAutoApproved
+        // In gateway mode, tool_auth only returns an auth URL for the frontend
+        // to open — no browser is launched server-side, so no approval needed.
+        if self.manager.should_use_gateway_mode() {
+            ApprovalRequirement::Never
+        } else {
+            ApprovalRequirement::UnlessAutoApproved
+        }
     }
 }
 
@@ -323,7 +329,7 @@ impl Tool for ToolActivateTool {
 
                 // Activation failed due to missing auth; initiate auth flow
                 // so the agent loop can show the auth card.
-                match self.manager.auth(name, None).await {
+                match self.manager.auth(name).await {
                     Ok(auth_result) if auth_result.is_authenticated() => {
                         // Auth succeeded (e.g. env var was set); retry activation.
                         let result = self
@@ -451,8 +457,8 @@ impl Tool for ToolRemoveTool {
     }
 
     fn description(&self) -> &str {
-        "Remove an installed extension (channel, tool, or MCP server). \
-         Unregisters tools and deletes configuration."
+        "Permanently remove an installed extension (channel, tool, or MCP server) from disk. \
+         This action cannot be undone — the WASM binary and configuration files will be deleted."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -492,7 +498,7 @@ impl Tool for ToolRemoveTool {
     }
 
     fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
-        ApprovalRequirement::UnlessAutoApproved
+        ApprovalRequirement::Always
     }
 }
 
@@ -701,7 +707,51 @@ mod tests {
         assert_eq!(tool.name(), "tool_remove");
         assert_eq!(
             tool.requires_approval(&serde_json::json!({})),
-            ApprovalRequirement::UnlessAutoApproved
+            ApprovalRequirement::Always
+        );
+    }
+
+    #[test]
+    fn tool_remove_always_requires_approval_regardless_of_params() {
+        use crate::tools::tool::ApprovalRequirement;
+        let tool = ToolRemoveTool {
+            manager: test_manager_stub(),
+        };
+
+        let test_cases = vec![
+            ("no params", serde_json::json!({})),
+            ("empty name", serde_json::json!({"name": ""})),
+            ("slack", serde_json::json!({"name": "slack"})),
+            ("github-cli", serde_json::json!({"name": "github-cli"})),
+            (
+                "with extra fields",
+                serde_json::json!({"name": "tool", "extra": "field"}),
+            ),
+        ];
+
+        for (case_name, params) in test_cases {
+            assert_eq!(
+                tool.requires_approval(&params),
+                ApprovalRequirement::Always,
+                "tool_remove must always require approval for case: {}",
+                case_name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_auth_no_approval_in_gateway_mode() {
+        let manager = test_manager_stub();
+        manager
+            .enable_gateway_mode("http://localhost:3000".to_string())
+            .await;
+        let tool = ToolAuthTool {
+            manager: manager.clone(),
+        };
+        assert_eq!(
+            tool.requires_approval(&serde_json::json!({})),
+            ApprovalRequirement::Never,
+            "tool_auth should not require approval in gateway mode"
         );
     }
 
@@ -740,15 +790,16 @@ mod tests {
     /// Create a stub manager for schema tests (these don't call execute).
     fn test_manager_stub() -> Arc<ExtensionManager> {
         use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
+        use crate::testing::credentials::TEST_CRYPTO_KEY;
         use crate::tools::ToolRegistry;
         use crate::tools::mcp::session::McpSessionManager;
 
-        let master_key =
-            secrecy::SecretString::from("0123456789abcdef0123456789abcdef".to_string());
+        let master_key = secrecy::SecretString::from(TEST_CRYPTO_KEY.to_string());
         let crypto = Arc::new(SecretsCrypto::new(master_key).unwrap());
 
         Arc::new(ExtensionManager::new(
             Arc::new(McpSessionManager::new()),
+            Arc::new(crate::tools::mcp::process::McpProcessManager::new()),
             Arc::new(InMemorySecretsStore::new(crypto)),
             Arc::new(ToolRegistry::new()),
             None,

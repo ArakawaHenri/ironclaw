@@ -27,6 +27,7 @@ pub struct WasmChannelLoader {
     pairing_store: Arc<PairingStore>,
     settings_store: Option<Arc<dyn SettingsStore>>,
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
+    owner_scope_id: String,
 }
 
 impl WasmChannelLoader {
@@ -35,12 +36,14 @@ impl WasmChannelLoader {
         runtime: Arc<WasmChannelRuntime>,
         pairing_store: Arc<PairingStore>,
         settings_store: Option<Arc<dyn SettingsStore>>,
+        owner_scope_id: impl Into<String>,
     ) -> Self {
         Self {
             runtime,
             pairing_store,
             settings_store,
             secrets_store: None,
+            owner_scope_id: owner_scope_id.into(),
         }
     }
 
@@ -149,6 +152,7 @@ impl WasmChannelLoader {
             self.runtime.clone(),
             prepared,
             capabilities,
+            self.owner_scope_id.clone(),
             config_json,
             self.pairing_store.clone(),
             self.settings_store.clone(),
@@ -184,18 +188,32 @@ impl WasmChannelLoader {
     /// └── telegram.capabilities.json
     /// ```
     pub async fn load_from_dir(&self, dir: &Path) -> Result<LoadResults, WasmChannelError> {
-        if !dir.is_dir() {
-            return Err(WasmChannelError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotADirectory,
-                format!("{} is not a directory", dir.display()),
-            )));
+        match fs::metadata(dir).await {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(WasmChannelError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    format!("{} is not a directory", dir.display()),
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(LoadResults::default());
+            }
+            Err(e) => return Err(WasmChannelError::Io(e)),
         }
 
         let mut results = LoadResults::default();
 
         // Collect all .wasm entries first, then load in parallel
         let mut channel_entries = Vec::new();
-        let mut entries = fs::read_dir(dir).await?;
+        // Handle TOCTOU: if read_dir fails with NotFound, treat as empty
+        let mut entries = match fs::read_dir(dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(LoadResults::default());
+            }
+            Err(e) => return Err(WasmChannelError::Io(e)),
+        };
 
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
@@ -473,7 +491,8 @@ mod tests {
     async fn test_loader_invalid_name() {
         let config = WasmChannelRuntimeConfig::for_testing();
         let runtime = Arc::new(WasmChannelRuntime::new(config).unwrap());
-        let loader = WasmChannelLoader::new(runtime, Arc::new(PairingStore::new()), None);
+        let loader =
+            WasmChannelLoader::new(runtime, Arc::new(PairingStore::new()), None, "default");
 
         let dir = TempDir::new().unwrap();
         let wasm_path = dir.path().join("test.wasm");
@@ -485,5 +504,23 @@ mod tests {
         // Empty name
         let result = loader.load_from_files("", &wasm_path, None).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn load_from_dir_returns_empty_when_dir_missing() {
+        let config = WasmChannelRuntimeConfig::for_testing();
+        let runtime = Arc::new(WasmChannelRuntime::new(config).unwrap());
+        let loader =
+            WasmChannelLoader::new(runtime, Arc::new(PairingStore::new()), None, "default");
+
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("nonexistent_channels_dir");
+
+        let results = loader.load_from_dir(&missing).await;
+
+        // Must succeed with empty results, not error
+        let results = results.expect("missing dir should return Ok, not Err");
+        assert!(results.loaded.is_empty());
+        assert!(results.errors.is_empty());
     }
 }

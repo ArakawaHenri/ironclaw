@@ -1,5 +1,5 @@
 [workspace]
-members = ["."]
+members = [".", "crates/ironclaw_safety"]
 exclude = [
     "channels-src/discord",
     "channels-src/telegram",
@@ -14,11 +14,13 @@ exclude = [
     "tools-src/google-slides",
     "tools-src/slack",
     "tools-src/telegram",
+    "fuzz",
+    "crates/ironclaw_safety/fuzz",
 ]
 
 [package]
 name = "ironclaw"
-version = "0.16.1"
+version = "0.19.0"
 edition = "2024"
 rust-version = "1.92"
 description = "Secure personal AI assistant that protects your data and expands its capabilities on the fly"
@@ -38,6 +40,7 @@ eula = false
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
+eventsource-stream = "0.2"
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls-native-roots", "stream"] }
@@ -98,6 +101,7 @@ tower-http = { version = "0.6", features = ["trace", "cors", "set-header"] }
 cron = "0.13"
 
 # Safety/sanitization
+ironclaw_safety = { path = "crates/ironclaw_safety", version = "0.1.0" }
 regex = "1"
 aho-corasick = "1"
 
@@ -174,6 +178,9 @@ readabilityrs = { version = "0.1.2", optional = true }
 ed25519-dalek = { version = "2.2.0", features = ["std"] }
 hex = "0.4.3"
 
+# OpenClaw import (feature gated)
+json5 = { version = "0.4", optional = true }
+
 # macOS keychain
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
@@ -191,6 +198,15 @@ testcontainers-modules = { version = "0.11", features = ["postgres"] }
 pretty_assertions = "1"
 tempfile = "3"
 insta = "1.46.3"
+criterion = "0.5"
+
+[[bench]]
+name = "safety_check"
+harness = false
+
+[[bench]]
+name = "safety_pipeline"
+harness = false
 
 [features]
 default = ["postgres", "libsql", "html-to-markdown"]
@@ -206,18 +222,29 @@ postgres = [
     "rust_decimal/db-tokio-postgres",
 ]
 libsql = ["dep:libsql"]
+# Opt-in feature for especially heavy integration-test targets that run in a
+# dedicated CI job instead of the default Rust test matrix.
 integration = []
 html-to-markdown = ["dep:html-to-markdown-rs", "dep:readabilityrs"]
 bedrock = ["dep:aws-config", "dep:aws-sdk-bedrockruntime", "dep:aws-smithy-types"]
+import = ["dep:json5", "libsql"]
+
+[[test]]
+name = "e2e_thread_scheduling"
+required-features = ["libsql", "integration"]
 
 [[test]]
 name = "html_to_markdown"
 required-features = ["html-to-markdown"]
 
+[profile.release]
+strip = true          # Remove debug symbols from release binaries
+
 # The profile that 'cargo dist' will build with
 [profile.dist]
 inherits = "release"
-lto = "thin"
+lto = "fat"           # Full cross-crate LTO (slow build, better codegen)
+codegen-units = 1     # Single codegen unit for maximum optimization
 
 # Config for 'dist'
 [workspace.metadata.dist]

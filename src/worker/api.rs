@@ -65,6 +65,7 @@ pub struct ProxyToolCompletionRequest {
     pub model: Option<String>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    pub stop_sequences: Option<Vec<String>>,
     pub tool_choice: Option<String>,
 }
 
@@ -251,6 +252,7 @@ impl WorkerHttpClient {
             model: request.model.clone(),
             max_tokens: request.max_tokens,
             temperature: request.temperature,
+            stop_sequences: request.stop_sequences.clone(),
             tool_choice: request.tool_choice.clone(),
         };
 
@@ -419,13 +421,14 @@ fn parse_finish_reason(s: &str) -> FinishReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::credentials::TEST_BEARER_TOKEN;
 
     #[test]
     fn test_url_construction() {
         let client = WorkerHttpClient::new(
             "http://host.docker.internal:50051".to_string(),
             Uuid::nil(),
-            "test-token".to_string(),
+            TEST_BEARER_TOKEN.to_string(),
         );
 
         assert_eq!(
@@ -449,7 +452,7 @@ mod tests {
         let client = WorkerHttpClient::new(
             "http://host.docker.internal:50051".to_string(),
             Uuid::nil(),
-            "test-token".to_string(),
+            TEST_BEARER_TOKEN.to_string(),
         );
 
         assert_eq!(

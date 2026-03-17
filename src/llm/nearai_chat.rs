@@ -16,8 +16,8 @@ use rust_decimal::prelude::MathematicalOps;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 
-use crate::config::NearAiConfig;
-use crate::error::LlmError;
+use crate::llm::config::NearAiConfig;
+use crate::llm::error::LlmError;
 use crate::llm::provider::{
     ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmProvider, Role, ToolCall,
     ToolCompletionRequest, ToolCompletionResponse,
@@ -110,7 +110,7 @@ impl NearAiChatProvider {
             handle.spawn(async move {
                 match fetch_pricing(&client, &base_url, api_key.as_ref(), &session).await {
                     Ok(map) if !map.is_empty() => {
-                        tracing::info!("Loaded NEAR AI pricing for {} model(s)", map.len());
+                        tracing::debug!("Loaded NEAR AI pricing for {} model(s)", map.len());
                         match pricing.write() {
                             Ok(mut guard) => *guard = map,
                             Err(poisoned) => *poisoned.into_inner() = map,
@@ -270,8 +270,11 @@ impl NearAiChatProvider {
             reason: format!("Failed to read response body: {}", e),
         })?;
 
-        tracing::debug!("NEAR AI Chat response status: {}", status);
-        tracing::debug!("NEAR AI Chat response body: {}", response_text);
+        // Log response body only at TRACE level to avoid exposing sensitive content
+        // (user-generated data, tool outputs, leaked secrets) in DEBUG logs
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!("NEAR AI Chat response body: {}", response_text);
+        }
 
         if !status.is_success() {
             let status_code = status.as_u16();
@@ -472,6 +475,7 @@ impl LlmProvider for NearAiChatProvider {
             messages,
             temperature: req.temperature,
             max_tokens: req.max_tokens,
+            stop: req.stop_sequences,
             tools: None,
             tool_choice: None,
         };
@@ -551,6 +555,7 @@ impl LlmProvider for NearAiChatProvider {
             messages,
             temperature: req.temperature,
             max_tokens: req.max_tokens,
+            stop: req.stop_sequences,
             tools: if tools.is_empty() { None } else { Some(tools) },
             tool_choice: req.tool_choice,
         };
@@ -676,6 +681,8 @@ struct ChatCompletionRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ChatCompletionTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1663,6 +1670,7 @@ mod tests {
             }],
             temperature: None,
             max_tokens: None,
+            stop: None,
             tools: None,
             tool_choice: None,
         };
@@ -1684,6 +1692,7 @@ mod tests {
             messages: vec![],
             temperature: Some(0.7),
             max_tokens: Some(1024),
+            stop: None,
             tools: Some(vec![ChatCompletionTool {
                 tool_type: "function".to_string(),
                 function: ChatCompletionFunction {

@@ -3,7 +3,7 @@
 //! This lets us use any rig-core provider (OpenAI, Anthropic, Ollama, etc.) as an
 //! `Arc<dyn LlmProvider>` without changing any of the agent, reasoning, or tool code.
 
-use crate::config::CacheRetention;
+use crate::llm::config::CacheRetention;
 use async_trait::async_trait;
 use rig::OneOrMany;
 use rig::completion::{
@@ -23,12 +23,13 @@ use serde_json::Value as JsonValue;
 
 use std::collections::HashSet;
 
-use crate::error::LlmError;
 use crate::llm::costs;
+use crate::llm::error::LlmError;
 use crate::llm::provider::{
     ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmProvider,
     ToolCall as IronToolCall, ToolCompletionRequest, ToolCompletionResponse,
-    ToolDefinition as IronToolDefinition,
+    ToolDefinition as IronToolDefinition, strip_unsupported_completion_params,
+    strip_unsupported_tool_params,
 };
 
 /// Adapter that wraps a rig-core `CompletionModel` and implements `LlmProvider`.
@@ -42,6 +43,9 @@ pub struct RigAdapter<M: CompletionModel> {
     /// via `additional_params` for Anthropic automatic caching. Also controls
     /// the cost multiplier for cache-creation tokens.
     cache_retention: CacheRetention,
+    /// Parameter names that this provider does not support (e.g., `"temperature"`).
+    /// These are stripped from requests before sending to avoid 400 errors.
+    unsupported_params: HashSet<String>,
 }
 
 impl<M: CompletionModel> RigAdapter<M> {
@@ -56,6 +60,7 @@ impl<M: CompletionModel> RigAdapter<M> {
             input_cost,
             output_cost,
             cache_retention: CacheRetention::None,
+            unsupported_params: HashSet::new(),
         }
     }
 
@@ -83,6 +88,25 @@ impl<M: CompletionModel> RigAdapter<M> {
             self.cache_retention = retention;
         }
         self
+    }
+
+    /// Set the list of unsupported parameter names for this provider.
+    ///
+    /// Parameters in this set are stripped from requests before sending.
+    /// Supported parameter names: `"temperature"`, `"max_tokens"`, `"stop_sequences"`.
+    pub fn with_unsupported_params(mut self, params: Vec<String>) -> Self {
+        self.unsupported_params = params.into_iter().collect();
+        self
+    }
+
+    /// Strip unsupported fields from a `CompletionRequest` in place.
+    fn strip_unsupported_completion_params(&self, req: &mut CompletionRequest) {
+        strip_unsupported_completion_params(&self.unsupported_params, req);
+    }
+
+    /// Strip unsupported fields from a `ToolCompletionRequest` in place.
+    fn strip_unsupported_tool_params(&self, req: &mut ToolCompletionRequest) {
+        strip_unsupported_tool_params(&self.unsupported_params, req);
     }
 }
 
@@ -333,15 +357,31 @@ fn convert_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<RigMessage
                 }
             }
             crate::llm::Role::Tool => {
-                // Tool result message: wrap as User { ToolResult }
+                // Tool result message: wrap as User { ToolResult }.
+                // Merge consecutive tool results into a single User message
+                // so the API sees one multi-result message instead of
+                // multiple consecutive User messages (which Anthropic rejects).
                 let tool_id = normalized_tool_call_id(msg.tool_call_id.as_deref(), history.len());
-                history.push(RigMessage::User {
-                    content: OneOrMany::one(UserContent::ToolResult(RigToolResult {
-                        id: tool_id.clone(),
-                        call_id: Some(tool_id),
-                        content: OneOrMany::one(ToolResultContent::text(&msg.content)),
-                    })),
+                let tool_result = UserContent::ToolResult(RigToolResult {
+                    id: tool_id.clone(),
+                    call_id: Some(tool_id),
+                    content: OneOrMany::one(ToolResultContent::text(&msg.content)),
                 });
+
+                let should_merge = matches!(
+                    history.last(),
+                    Some(RigMessage::User { content }) if content.iter().all(|c| matches!(c, UserContent::ToolResult(_)))
+                );
+
+                if should_merge {
+                    if let Some(RigMessage::User { content }) = history.last_mut() {
+                        content.push(tool_result);
+                    }
+                } else {
+                    history.push(RigMessage::User {
+                        content: OneOrMany::one(tool_result),
+                    });
+                }
             }
         }
     }
@@ -539,7 +579,10 @@ where
         }
     }
 
-    async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+    async fn complete(
+        &self,
+        mut request: CompletionRequest,
+    ) -> Result<CompletionResponse, LlmError> {
         if let Some(requested_model) = request.model.as_deref()
             && requested_model != self.model_name.as_str()
         {
@@ -549,6 +592,8 @@ where
                 "Per-request model override is not supported for this provider; using configured model"
             );
         }
+
+        self.strip_unsupported_completion_params(&mut request);
 
         let mut messages = request.messages;
         crate::llm::provider::sanitize_tool_messages(&mut messages);
@@ -599,7 +644,7 @@ where
 
     async fn complete_with_tools(
         &self,
-        request: ToolCompletionRequest,
+        mut request: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError> {
         if let Some(requested_model) = request.model.as_deref()
             && requested_model != self.model_name.as_str()
@@ -610,6 +655,8 @@ where
                 "Per-request model override is not supported for this provider; using configured model"
             );
         }
+
+        self.strip_unsupported_tool_params(&mut request);
 
         let known_tool_names: HashSet<String> =
             request.tools.iter().map(|t| t.name.clone()).collect();
@@ -1155,5 +1202,162 @@ mod tests {
         // Non-Claude models
         assert!(!supports_prompt_cache("gpt-4o"));
         assert!(!supports_prompt_cache("llama3"));
+    }
+
+    #[test]
+    fn test_with_unsupported_params_populates_set() {
+        use rig::client::CompletionClient;
+        use rig::providers::openai;
+
+        let client: openai::Client = openai::Client::builder()
+            .api_key("test-key")
+            .base_url("http://localhost:0")
+            .build()
+            .unwrap();
+        let client = client.completions_api();
+        let model = client.completion_model("test-model");
+        let adapter = RigAdapter::new(model, "test-model")
+            .with_unsupported_params(vec!["temperature".to_string()]);
+
+        assert!(adapter.unsupported_params.contains("temperature"));
+        assert!(!adapter.unsupported_params.contains("max_tokens"));
+    }
+
+    #[test]
+    fn test_strip_unsupported_completion_params() {
+        use rig::client::CompletionClient;
+        use rig::providers::openai;
+
+        let client: openai::Client = openai::Client::builder()
+            .api_key("test-key")
+            .base_url("http://localhost:0")
+            .build()
+            .unwrap();
+        let client = client.completions_api();
+        let model = client.completion_model("test-model");
+        let adapter = RigAdapter::new(model, "test-model").with_unsupported_params(vec![
+            "temperature".to_string(),
+            "stop_sequences".to_string(),
+        ]);
+
+        let mut req = CompletionRequest::new(vec![ChatMessage::user("hi")]);
+        req.temperature = Some(0.7);
+        req.max_tokens = Some(100);
+        req.stop_sequences = Some(vec!["STOP".to_string()]);
+
+        adapter.strip_unsupported_completion_params(&mut req);
+
+        assert!(req.temperature.is_none(), "temperature should be stripped");
+        assert_eq!(req.max_tokens, Some(100), "max_tokens should be preserved");
+        assert!(
+            req.stop_sequences.is_none(),
+            "stop_sequences should be stripped"
+        );
+    }
+
+    #[test]
+    fn test_strip_unsupported_tool_params() {
+        use rig::client::CompletionClient;
+        use rig::providers::openai;
+
+        let client: openai::Client = openai::Client::builder()
+            .api_key("test-key")
+            .base_url("http://localhost:0")
+            .build()
+            .unwrap();
+        let client = client.completions_api();
+        let model = client.completion_model("test-model");
+        let adapter = RigAdapter::new(model, "test-model")
+            .with_unsupported_params(vec!["temperature".to_string(), "max_tokens".to_string()]);
+
+        let mut req = ToolCompletionRequest::new(vec![ChatMessage::user("hi")], vec![]);
+        req.temperature = Some(0.5);
+        req.max_tokens = Some(200);
+
+        adapter.strip_unsupported_tool_params(&mut req);
+
+        assert!(req.temperature.is_none(), "temperature should be stripped");
+        assert!(req.max_tokens.is_none(), "max_tokens should be stripped");
+    }
+
+    #[test]
+    fn test_unsupported_params_empty_by_default() {
+        use rig::client::CompletionClient;
+        use rig::providers::openai;
+
+        let client: openai::Client = openai::Client::builder()
+            .api_key("test-key")
+            .base_url("http://localhost:0")
+            .build()
+            .unwrap();
+        let client = client.completions_api();
+        let model = client.completion_model("test-model");
+        let adapter = RigAdapter::new(model, "test-model");
+
+        assert!(adapter.unsupported_params.is_empty());
+    }
+
+    /// Regression test: consecutive tool_result messages from parallel tool
+    /// execution must be merged into a single User message with multiple
+    /// ToolResult content items. Without merging, APIs like Anthropic reject
+    /// the request due to consecutive User messages.
+    #[test]
+    fn test_consecutive_tool_results_merged_into_single_user_message() {
+        let tc1 = IronToolCall {
+            id: "call_a".to_string(),
+            name: "search".to_string(),
+            arguments: serde_json::json!({"q": "rust"}),
+        };
+        let tc2 = IronToolCall {
+            id: "call_b".to_string(),
+            name: "fetch".to_string(),
+            arguments: serde_json::json!({"url": "https://example.com"}),
+        };
+        let assistant = ChatMessage::assistant_with_tool_calls(None, vec![tc1, tc2]);
+        let result_a = ChatMessage::tool_result("call_a", "search", "search results");
+        let result_b = ChatMessage::tool_result("call_b", "fetch", "fetch results");
+
+        let messages = vec![assistant, result_a, result_b];
+        let (_preamble, history) = convert_messages(&messages);
+
+        // Should be: 1 assistant + 1 merged user (not 1 assistant + 2 users)
+        assert_eq!(
+            history.len(),
+            2,
+            "Expected 2 messages (assistant + merged user), got {}",
+            history.len()
+        );
+
+        // The second message should contain both tool results
+        match &history[1] {
+            RigMessage::User { content } => {
+                assert_eq!(
+                    content.len(),
+                    2,
+                    "Expected 2 tool results in merged user message, got {}",
+                    content.len()
+                );
+                for item in content.iter() {
+                    assert!(
+                        matches!(item, UserContent::ToolResult(_)),
+                        "Expected ToolResult content"
+                    );
+                }
+            }
+            other => panic!("Expected User message, got: {:?}", other),
+        }
+    }
+
+    /// Verify that a tool_result after a non-tool User message is NOT merged.
+    #[test]
+    fn test_tool_result_after_user_text_not_merged() {
+        let user_msg = ChatMessage::user("hello");
+        let tool_msg = ChatMessage::tool_result("call_1", "search", "results");
+
+        let messages = vec![user_msg, tool_msg];
+        let (_preamble, history) = convert_messages(&messages);
+
+        // Should be 2 separate User messages (text user + tool result user)
+        assert_eq!(history.len(), 2);
     }
 }

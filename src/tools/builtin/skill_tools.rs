@@ -301,7 +301,11 @@ impl Tool for SkillInstallTool {
         let content = if let Some(raw) = params.get("content").and_then(|v| v.as_str()) {
             // Direct content provided
             raw.to_string()
-        } else if let Some(url) = params.get("url").and_then(|v| v.as_str()) {
+        } else if let Some(url) = params
+            .get("url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
             // Fetch from explicit URL
             fetch_skill_content(url).await?
         } else {
@@ -709,7 +713,8 @@ impl Tool for SkillRemoveTool {
     }
 
     fn description(&self) -> &str {
-        "Remove an installed skill by name. Only user-installed skills can be removed."
+        "Permanently remove an installed skill from disk. This action cannot be undone — \
+         the skill files will be deleted."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -770,7 +775,7 @@ impl Tool for SkillRemoveTool {
     }
 
     fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
-        ApprovalRequirement::UnlessAutoApproved
+        ApprovalRequirement::Always
     }
 }
 
@@ -837,10 +842,39 @@ mod tests {
         assert_eq!(tool.name(), "skill_remove");
         assert_eq!(
             tool.requires_approval(&serde_json::json!({})),
-            ApprovalRequirement::UnlessAutoApproved
+            ApprovalRequirement::Always
         );
         let schema = tool.parameters_schema();
         assert!(schema["properties"].get("name").is_some());
+    }
+
+    #[test]
+    fn skill_remove_always_requires_approval_regardless_of_params() {
+        use crate::tools::tool::ApprovalRequirement;
+        let tool = SkillRemoveTool::new(test_registry());
+
+        let test_cases = vec![
+            ("no params", serde_json::json!({})),
+            ("empty name", serde_json::json!({"name": ""})),
+            (
+                "deployment skill",
+                serde_json::json!({"name": "deployment"}),
+            ),
+            ("custom skill", serde_json::json!({"name": "custom-skill"})),
+            (
+                "with extra fields",
+                serde_json::json!({"name": "skill", "extra": "field"}),
+            ),
+        ];
+
+        for (case_name, params) in test_cases {
+            assert_eq!(
+                tool.requires_approval(&params),
+                ApprovalRequirement::Always,
+                "skill_remove must always require approval for case: {}",
+                case_name
+            );
+        }
     }
 
     #[test]
@@ -1266,5 +1300,24 @@ mod tests {
                 url
             );
         }
+    }
+
+    #[test]
+    fn test_empty_url_param_is_treated_as_absent() {
+        // LLMs sometimes pass "" for optional parameters instead of omitting them.
+        // Before the fix, url: "" would match Some("") and attempt to fetch from an
+        // empty URL (failing with an invalid URL error) instead of falling through to
+        // the catalog lookup. The full execute path cannot be tested here without a
+        // real catalog and database, so this test verifies the parameter filtering
+        // behaviour directly.
+        let params = serde_json::json!({"name": "my-skill", "url": ""});
+        let url = params
+            .get("url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        assert!(
+            url.is_none(),
+            "empty url string should be treated as absent"
+        );
     }
 }

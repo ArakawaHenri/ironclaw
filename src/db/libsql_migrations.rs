@@ -462,7 +462,7 @@ CREATE TABLE IF NOT EXISTS routines (
     max_concurrent INTEGER NOT NULL DEFAULT 1,
     dedup_window_secs INTEGER,
     notify_channel TEXT,
-    notify_user TEXT NOT NULL DEFAULT 'default',
+    notify_user TEXT,
     notify_on_success INTEGER NOT NULL DEFAULT 0,
     notify_on_failure INTEGER NOT NULL DEFAULT 1,
     notify_on_attention INTEGER NOT NULL DEFAULT 1,
@@ -546,7 +546,9 @@ CREATE INDEX IF NOT EXISTS idx_tool_failures_unrepaired ON tool_failures(tool_na
 
 -- routines
 CREATE INDEX IF NOT EXISTS idx_routines_next_fire ON routines(next_fire_at);
-CREATE INDEX IF NOT EXISTS idx_routines_event_triggers ON routines(user_id);
+CREATE INDEX IF NOT EXISTS idx_routines_event_triggers
+    ON routines(trigger_type, user_id)
+    WHERE enabled = 1 AND trigger_type IN ('event', 'system_event');
 
 -- routine_runs
 CREATE INDEX IF NOT EXISTS idx_routine_runs_status ON routine_runs(status);
@@ -583,20 +585,21 @@ INSERT OR IGNORE INTO leak_detection_patterns (id, name, pattern, severity, acti
 ///
 /// Each entry is `(version, name, sql)`. Migrations are idempotent: the
 /// `_migrations` table tracks which versions have been applied.
-pub const INCREMENTAL_MIGRATIONS: &[(i64, &str, &str)] = &[(
-    9,
-    "flexible_embedding_dimension",
-    // Rebuild memory_chunks to remove the fixed F32_BLOB(1536) type
-    // constraint so any embedding dimension works. Existing embeddings
-    // are preserved; users only need to re-embed if they change models.
-    //
-    // The vector index (libsql_vector_idx) requires a fixed-dimension
-    // F32_BLOB(N), so we drop it entirely. Vector search falls back to
-    // brute-force cosine distance which is fast enough for personal
-    // assistant workspaces. This matches PostgreSQL after its V9 migration.
-    //
-    // SQLite cannot ALTER COLUMN types, so we recreate the table.
-    r#"
+pub const INCREMENTAL_MIGRATIONS: &[(i64, &str, &str)] = &[
+    (
+        9,
+        "flexible_embedding_dimension",
+        // Rebuild memory_chunks to remove the fixed F32_BLOB(1536) type
+        // constraint so any embedding dimension works. Existing embeddings
+        // are preserved; users only need to re-embed if they change models.
+        //
+        // The vector index (libsql_vector_idx) requires a fixed-dimension
+        // F32_BLOB(N), so we drop it entirely. Vector search falls back to
+        // brute-force cosine distance which is fast enough for personal
+        // assistant workspaces. This matches PostgreSQL after its V9 migration.
+        //
+        // SQLite cannot ALTER COLUMN types, so we recreate the table.
+        r#"
 -- Drop vector index (requires fixed F32_BLOB(N), incompatible with flexible dimensions)
 DROP INDEX IF EXISTS idx_memory_chunks_embedding;
 
@@ -644,7 +647,86 @@ CREATE TRIGGER IF NOT EXISTS memory_chunks_fts_update AFTER UPDATE ON memory_chu
     INSERT INTO memory_chunks_fts(rowid, content) VALUES (new._rowid, new.content);
 END;
 "#,
-)];
+    ),
+    (
+        12,
+        "job_token_budget",
+        // Add token budget tracking columns to agent_jobs.
+        // SQLite supports ALTER TABLE ADD COLUMN, so no table rebuild needed.
+        r#"
+ALTER TABLE agent_jobs ADD COLUMN max_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agent_jobs ADD COLUMN total_tokens_used INTEGER NOT NULL DEFAULT 0;
+"#,
+    ),
+    (
+        13,
+        "routine_notify_user_nullable",
+        // Remove the legacy 'default' sentinel from routine notify_user.
+        // SQLite cannot drop NOT NULL / DEFAULT constraints in place, so we
+        // rebuild the table and normalize existing 'default' values to NULL.
+        r#"
+PRAGMA foreign_keys=OFF;
+
+CREATE TABLE IF NOT EXISTS routines_new (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    trigger_type TEXT NOT NULL,
+    trigger_config TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    action_config TEXT NOT NULL,
+    cooldown_secs INTEGER NOT NULL DEFAULT 300,
+    max_concurrent INTEGER NOT NULL DEFAULT 1,
+    dedup_window_secs INTEGER,
+    notify_channel TEXT,
+    notify_user TEXT,
+    notify_on_success INTEGER NOT NULL DEFAULT 0,
+    notify_on_failure INTEGER NOT NULL DEFAULT 1,
+    notify_on_attention INTEGER NOT NULL DEFAULT 1,
+    state TEXT NOT NULL DEFAULT '{}',
+    last_run_at TEXT,
+    next_fire_at TEXT,
+    run_count INTEGER NOT NULL DEFAULT 0,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (user_id, name)
+);
+
+INSERT INTO routines_new (
+    id, name, description, user_id, enabled,
+    trigger_type, trigger_config, action_type, action_config,
+    cooldown_secs, max_concurrent, dedup_window_secs,
+    notify_channel, notify_user, notify_on_success, notify_on_failure, notify_on_attention,
+    state, last_run_at, next_fire_at, run_count, consecutive_failures,
+    created_at, updated_at
+)
+SELECT
+    id, name, description, user_id, enabled,
+    trigger_type, trigger_config, action_type, action_config,
+    cooldown_secs, max_concurrent, dedup_window_secs,
+    notify_channel,
+    CASE WHEN notify_user = 'default' THEN NULL ELSE notify_user END,
+    notify_on_success, notify_on_failure, notify_on_attention,
+    state, last_run_at, next_fire_at, run_count, consecutive_failures,
+    created_at, updated_at
+FROM routines;
+
+DROP TABLE routines;
+ALTER TABLE routines_new RENAME TO routines;
+
+CREATE INDEX IF NOT EXISTS idx_routines_user ON routines(user_id);
+CREATE INDEX IF NOT EXISTS idx_routines_next_fire ON routines(next_fire_at);
+CREATE INDEX IF NOT EXISTS idx_routines_event_triggers
+    ON routines(trigger_type, user_id)
+    WHERE enabled = 1 AND trigger_type IN ('event', 'system_event');
+
+PRAGMA foreign_keys=ON;
+"#,
+    ),
+];
 
 /// Run incremental migrations that haven't been applied yet.
 ///
@@ -653,6 +735,7 @@ END;
 pub async fn run_incremental(conn: &libsql::Connection) -> Result<(), crate::error::DatabaseError> {
     use crate::error::DatabaseError;
 
+    let mut applied_count = 0;
     for &(version, name, sql) in INCREMENTAL_MIGRATIONS {
         // Check if already applied
         let mut rows = conn
@@ -668,8 +751,6 @@ pub async fn run_incremental(conn: &libsql::Connection) -> Result<(), crate::err
         if rows.next().await.ok().flatten().is_some() {
             continue; // Already applied
         }
-
-        tracing::info!(version, name, "libSQL: applying incremental migration");
 
         // Wrap migration + recording in a transaction for atomicity.
         // If the process crashes mid-migration, the transaction rolls back
@@ -702,7 +783,12 @@ pub async fn run_incremental(conn: &libsql::Connection) -> Result<(), crate::err
             ))
         })?;
 
-        tracing::info!(version, name, "libSQL: migration applied successfully");
+        applied_count += 1;
+        tracing::debug!(version, name, "libSQL: migration applied");
+    }
+
+    if applied_count > 0 {
+        tracing::info!("libSQL: applied {} incremental migrations", applied_count);
     }
 
     Ok(())

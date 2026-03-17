@@ -1,6 +1,8 @@
 """Shared helpers for E2E tests."""
 
 import asyncio
+import hashlib
+import hmac
 import re
 import time
 
@@ -95,12 +97,21 @@ SEL = {
     "toast_success":            ".toast.toast-success",
     "toast_error":              ".toast.toast-error",
     "toast_info":               ".toast.toast-info",
+    # Jobs / routines
+    "jobs_tbody":               "#jobs-tbody",
+    "job_row":                  "#jobs-tbody .job-row",
+    "jobs_empty":               "#jobs-empty",
+    "routines_tbody":           "#routines-tbody",
+    "routine_row":              "#routines-tbody .routine-row",
+    "routines_empty":           "#routines-empty",
 }
 
 TABS = ["chat", "memory", "jobs", "routines", "extensions", "skills"]
 
 # Auth token used across all tests
 AUTH_TOKEN = "e2e-test-token"
+OWNER_SCOPE_ID = "e2e-owner-scope"
+HTTP_WEBHOOK_SECRET = "e2e-http-webhook-secret"
 
 
 async def wait_for_ready(url: str, *, timeout: float = 60, interval: float = 0.5):
@@ -133,3 +144,45 @@ async def wait_for_port_line(process, pattern: str, *, timeout: float = 60) -> i
         if match := re.search(pattern, decoded):
             return int(match.group(1))
     raise TimeoutError(f"Port pattern '{pattern}' not found in stdout after {timeout}s")
+
+
+# -- API helpers -----------------------------------------------------------
+
+def auth_headers() -> dict[str, str]:
+    """Return Authorization header dict for authenticated API calls."""
+    return {"Authorization": f"Bearer {AUTH_TOKEN}"}
+
+
+async def api_get(base_url: str, path: str, **kwargs) -> httpx.Response:
+    """Make an authenticated GET request to the ironclaw API."""
+    async with httpx.AsyncClient() as client:
+        return await client.get(
+            f"{base_url}{path}",
+            headers=auth_headers(),
+            timeout=kwargs.pop("timeout", 10),
+            **kwargs,
+        )
+
+
+async def api_post(base_url: str, path: str, **kwargs) -> httpx.Response:
+    """Make an authenticated POST request to the ironclaw API."""
+    async with httpx.AsyncClient() as client:
+        return await client.post(
+            f"{base_url}{path}",
+            headers=auth_headers(),
+            timeout=kwargs.pop("timeout", 10),
+            **kwargs,
+        )
+
+
+def signed_http_webhook_headers(body: bytes) -> dict[str, str]:
+    """Return headers for the owner-scoped HTTP webhook channel."""
+    digest = hmac.new(
+        HTTP_WEBHOOK_SECRET.encode("utf-8"),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+    return {
+        "Content-Type": "application/json",
+        "X-Hub-Signature-256": f"sha256={digest}",
+    }

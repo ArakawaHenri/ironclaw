@@ -70,19 +70,21 @@ echo
 # This is a WARNING, not a hard violation.
 # --------------------------------------------------------------------------
 
-echo "--- Check 2: .unwrap() / .expect() in production code ---"
+echo "--- Check 2: .unwrap() / .expect() / assert!() in production code ---"
 
-# Collect raw matches excluding obvious test-only files and lines
-raw_results=$(grep -rn '\.unwrap()\|\.expect(' src/ \
+# Collect raw matches excluding obvious test-only files and lines.
+# Also catches assert!(), assert_eq!(), assert_ne!() but NOT debug_assert variants.
+raw_results=$(grep -rnE '\.(unwrap|expect)\(|[^_]assert(_eq|_ne)?!' src/ \
     --include='*.rs' \
     | grep -v 'src/main.rs' \
     | grep -v 'src/testing.rs' \
     | grep -v 'src/setup/' \
+    | grep -Ev 'debug_assert|// safety:' \
     || true)
 
 if [ -n "$raw_results" ]; then
     total=$(echo "$raw_results" | wc -l | tr -d ' ')
-    echo "WARNING: ~$total .unwrap()/.expect() calls found in src/ (excluding main/testing/setup)."
+    echo "WARNING: ~$total .unwrap()/.expect()/assert!() calls found in src/ (excluding main/testing/setup)."
     echo "Many are in test modules; a per-file breakdown helps triage:"
     echo
     # Show per-file counts, sorted by count descending, top 15
@@ -204,6 +206,56 @@ if [ -n "$skip_results" ]; then
     echo "$skip_results"
     echo
     violations=$((violations + 1))
+else
+    echo "OK"
+fi
+echo
+
+# --------------------------------------------------------------------------
+# Check 6: LLM module isolation — no imports from other crate modules
+# --------------------------------------------------------------------------
+# src/llm/ should only import from:
+#   - crate::llm (self-references)
+#   - external crates (no crate:: prefix)
+# It must NOT import from crate::agent, crate::tools, crate::channels,
+# crate::safety, crate::config, crate::bootstrap, crate::cli, crate::db,
+# crate::workspace, crate::worker, crate::orchestrator, crate::skills,
+# crate::hooks, crate::setup, crate::context, etc.
+#
+# Test-only imports (crate::testing) are excluded since they don't affect
+# the runtime dependency graph and won't exist in the extracted crate.
+# --------------------------------------------------------------------------
+
+echo "--- Check 6: LLM module isolation ---"
+
+# Match any `crate::` reference (use-imports AND inline paths) that isn't
+# crate::llm or crate::testing.  Filter out comments.
+# We strip inline comments (everything after //) with sed before checking,
+# so a line like `real_code(crate::foo); // crate::llm` is still caught.
+results=$(grep -rn 'crate::' src/llm/ \
+    --include='*.rs' \
+    | grep -v '^\s*//' \
+    | sed 's|//.*||' \
+    | grep 'crate::' \
+    | grep -v 'crate::llm' \
+    | grep -v 'crate::testing' \
+    || true)
+
+if [ -n "$results" ]; then
+    count=$(echo "$results" | wc -l | tr -d ' ')
+    echo "WARNING: src/llm/ has $count reference(s) to modules outside crate::llm:"
+    echo "$results"
+    echo
+    echo "(These are pre-existing; fix them before extracting the crate.)"
+    echo "(New 'use crate::' imports are hard violations — see below.)"
+    echo
+    # Hard-fail only on new `use crate::` imports (easy to avoid in new code).
+    use_imports=$(echo "$results" | grep '^[^:]*:.*use crate::' || true)
+    if [ -n "$use_imports" ]; then
+        echo "HARD VIOLATION: new 'use crate::' imports in src/llm/:"
+        echo "$use_imports"
+        violations=$((violations + 1))
+    fi
 else
     echo "OK"
 fi

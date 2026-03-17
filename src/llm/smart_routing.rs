@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use regex::Regex;
 use rust_decimal::Decimal;
 
-use crate::error::LlmError;
+use crate::llm::error::LlmError;
 use crate::llm::provider::{
     CompletionRequest, CompletionResponse, LlmProvider, ModelMetadata, Role, ToolCompletionRequest,
     ToolCompletionResponse,
@@ -248,7 +248,7 @@ fn build_domain_regex(keywords: &[&str]) -> Regex {
     let pattern = format!(r"(?i)\b({})\b", keywords.join("|"));
     Regex::new(&pattern).unwrap_or_else(|e| {
         tracing::warn!(error = %e, "Invalid domain keywords pattern, using minimal fallback");
-        Regex::new(r"(?i)\b(api|code|deploy)\b").expect("fallback regex is valid")
+        Regex::new(r"(?i)\b(api|code|deploy)\b").expect("fallback regex is valid") // safety: hardcoded literal
     })
 }
 
@@ -274,71 +274,71 @@ use std::sync::LazyLock;
 static RE_REASONING: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)\b(why|how|explain|analyze|analyse|compare|contrast|evaluate|assess|reason|think|consider|implications?|consequences?|trade-?offs?|pros?\s*(and|&)\s*cons?|advantages?|disadvantages?|benefits?|drawbacks?|differs?|difference|versus|vs\.?|better|worse|optimal|best|worst)\b"
-    ).expect("RE_REASONING is a valid regex")
+    ).expect("RE_REASONING is a valid regex") // safety: hardcoded literal
 });
 
 static RE_MULTI_STEP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)\b(first|then|next|after|before|finally|step|steps|phase|stages?|process|workflow|sequence|procedure|pipeline|chain|series|order|followed by)\b"
-    ).expect("RE_MULTI_STEP is a valid regex")
+    ).expect("RE_MULTI_STEP is a valid regex") // safety: hardcoded literal
 });
 
 static RE_CREATIVITY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)\b(write|create|generate|compose|design|imagine|brainstorm|ideate|draft|invent|story|poem|essay|article|blog|content|narrative|script|summarize|summarise|rewrite|paraphrase|translate|adapt|tweet|post|thread|outline|structure|format|style|tone|voice)\b"
-    ).expect("RE_CREATIVITY is a valid regex")
+    ).expect("RE_CREATIVITY is a valid regex") // safety: hardcoded literal
 });
 
 static RE_PRECISION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)\b(\d{4}|\d+\.\d+|exactly|precisely|specific|accurate|correct|verify|confirm|date|time|number|calculate|compute|measure|count)\b"
-    ).expect("RE_PRECISION is a valid regex")
+    ).expect("RE_PRECISION is a valid regex") // safety: hardcoded literal
 });
 
 static RE_CODE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)(`{1,3}|```|function|const|let|var|import|export|class|def |async|await|=>|\.ts|\.js|\.py|\.rs|\.go|\.sol|\(\)|\[\]|\{\}|<[A-Z][a-z]+>|useState|useEffect|npm|yarn|pnpm|cargo|pip|implement|rebase|merge|commit|branch|PR|pull.?request|columns?|migrations?|module|refactor|debug|fix|bug|error|schema|database|query)"
-    ).expect("RE_CODE is a valid regex")
+    ).expect("RE_CODE is a valid regex") // safety: hardcoded literal
 });
 
 static RE_TOOL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)\b(file|read|write|search|fetch|run|execute|check|look up|find|open|save|send|post|get|download|upload|install|deploy|build|compile|test|add|update|remove|delete|modify|change|edit|create|resolve|push|pull|clone)\b"
-    ).expect("RE_TOOL is a valid regex")
+    ).expect("RE_TOOL is a valid regex") // safety: hardcoded literal
 });
 
 static RE_SAFETY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)\b(password|secret|private|confidential|medical|legal|financial|personal|sensitive|ssn|credit.?card|auth|token|key|encrypt|decrypt|hash|vulnerability|exploit|attack|breach)\b"
-    ).expect("RE_SAFETY is a valid regex")
+    ).expect("RE_SAFETY is a valid regex") // safety: hardcoded literal
 });
 
 static RE_CONTEXT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)\b(previous|earlier|above|before|last|that|those|it|they|we discussed|you said|mentioned|remember|recall|as I said|like I mentioned)\b"
-    ).expect("RE_CONTEXT is a valid regex")
+    ).expect("RE_CONTEXT is a valid regex") // safety: hardcoded literal
 });
 
 static RE_VAGUE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(it|this|that|something|stuff|thing|things)\b")
-        .expect("RE_VAGUE is a valid regex")
+        .expect("RE_VAGUE is a valid regex") // safety: hardcoded literal
 });
 
 static RE_OPEN_ENDED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(why|how|what if|explain|describe|elaborate|discuss)\b")
-        .expect("RE_OPEN_ENDED is a valid regex")
+        .expect("RE_OPEN_ENDED is a valid regex") // safety: hardcoded literal
 });
 
 static RE_CONJUNCTIONS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)\b(and|but|or|however|therefore|because|although|while|whereas|moreover|furthermore)\b",
     )
-    .expect("RE_CONJUNCTIONS is a valid regex")
+    .expect("RE_CONJUNCTIONS is a valid regex") // safety: hardcoded literal
 });
 
 static RE_TIER_HINT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\[tier:(flash|standard|pro|frontier)\]")
-        .expect("RE_TIER_HINT is a valid regex")
+        .expect("RE_TIER_HINT is a valid regex") // safety: hardcoded literal
 });
 
 /// Default domain regex, compiled once from `DEFAULT_DOMAIN_KEYWORDS`.
@@ -363,7 +363,7 @@ static DEFAULT_OVERRIDES: LazyLock<Vec<PatternOverride>> = LazyLock::new(|| {
             regex: Regex::new(
                 r"(?i)^(hi|hello|hey|thanks|ok|sure|yes|no|yep|nope|cool|nice|great|got it)$",
             )
-            .expect("greeting pattern is valid"),
+            .expect("greeting pattern is valid"), // safety: hardcoded literal
             tier: Tier::Flash,
         },
         // Flash tier: quick lookups (end-anchored to avoid matching complex questions
@@ -372,29 +372,29 @@ static DEFAULT_OVERRIDES: LazyLock<Vec<PatternOverride>> = LazyLock::new(|| {
             regex: Regex::new(
                 r"(?i)^what(?:'s|\s+is)?\s+(?:the\s+)?(time|date|day|weather)\b(?:\s+(?:is\s+it|today|now|in\s+\S+))?[?.!]*$",
             )
-            .expect("lookup pattern is valid"),
+            .expect("lookup pattern is valid"), // safety: hardcoded literal
             tier: Tier::Flash,
         },
         // Frontier tier: security audits
         PatternOverride {
             regex: Regex::new(r"(?i)security.*(audit|review|scan)")
-                .expect("security audit pattern is valid"),
+                .expect("security audit pattern is valid"), // safety: hardcoded literal
             tier: Tier::Frontier,
         },
         PatternOverride {
             regex: Regex::new(r"(?i)vulnerabilit(y|ies).*(review|scan|check|audit)")
-                .expect("vulnerability pattern is valid"),
+                .expect("vulnerability pattern is valid"), // safety: hardcoded literal
             tier: Tier::Frontier,
         },
         // Pro tier: production deployments
         PatternOverride {
             regex: Regex::new(r"(?i)deploy.*(mainnet|production)")
-                .expect("deploy pattern is valid"),
+                .expect("deploy pattern is valid"), // safety: hardcoded literal
             tier: Tier::Pro,
         },
         PatternOverride {
             regex: Regex::new(r"(?i)production.*(deploy|release|push)")
-                .expect("production pattern is valid"),
+                .expect("production pattern is valid"), // safety: hardcoded literal
             tier: Tier::Pro,
         },
     ]
@@ -451,7 +451,7 @@ fn score_complexity_internal(
 
     // Check for explicit tier hint (e.g. "[tier:flash]")
     if let Some(caps) = RE_TIER_HINT.captures(prompt) {
-        let tier_str = caps.get(1).expect("capture group 1 exists").as_str();
+        let tier_str = caps.get(1).expect("capture group 1 exists").as_str(); // safety: RE_TIER_HINT has group 1
         let tier = match tier_str.to_lowercase().as_str() {
             "flash" => Tier::Flash,
             "standard" => Tier::Standard,
@@ -758,7 +758,8 @@ impl SmartRoutingProvider {
 
         // Highest priority: explicit tier hints (e.g. "[tier:flash]")
         if let Some(caps) = RE_TIER_HINT.captures(last_user_msg) {
-            let tier_str = caps.get(1).expect("capture group 1 exists").as_str();
+            // SAFETY: RE_TIER_HINT has exactly one capture group; get(1) is guaranteed Some after match.
+            let tier_str = caps.get(1).expect("capture group 1 exists").as_str(); // safety: RE_TIER_HINT has group 1
             let tier = match tier_str.to_lowercase().as_str() {
                 "flash" => Tier::Flash,
                 "standard" => Tier::Standard,
@@ -770,7 +771,7 @@ impl SmartRoutingProvider {
                 }
             };
             let complexity = TaskComplexity::from(tier);
-            tracing::debug!(
+            tracing::trace!(
                 %tier,
                 ?complexity,
                 "Smart routing: explicit tier hint"
@@ -782,7 +783,7 @@ impl SmartRoutingProvider {
         for po in DEFAULT_OVERRIDES.iter() {
             if po.regex.is_match(last_user_msg) {
                 let complexity = TaskComplexity::from(po.tier);
-                tracing::debug!(
+                tracing::trace!(
                     tier = %po.tier,
                     ?complexity,
                     "Smart routing: pattern override matched"
@@ -798,7 +799,7 @@ impl SmartRoutingProvider {
             &self.domain_regex,
         );
         let complexity = TaskComplexity::from(breakdown.tier);
-        tracing::debug!(
+        tracing::trace!(
             score = breakdown.total,
             tier = %breakdown.tier,
             ?complexity,
@@ -872,7 +873,7 @@ impl LlmProvider for SmartRoutingProvider {
 
         match complexity {
             TaskComplexity::Simple => {
-                tracing::debug!(
+                tracing::trace!(
                     model = %self.cheap.model_name(),
                     "Smart routing: Simple task -> cheap model"
                 );
@@ -880,7 +881,7 @@ impl LlmProvider for SmartRoutingProvider {
                 self.cheap.complete(request).await
             }
             TaskComplexity::Complex => {
-                tracing::debug!(
+                tracing::trace!(
                     model = %self.primary.model_name(),
                     "Smart routing: Complex task -> primary model"
                 );
@@ -889,7 +890,7 @@ impl LlmProvider for SmartRoutingProvider {
             }
             TaskComplexity::Moderate => {
                 if self.config.cascade_enabled {
-                    tracing::debug!(
+                    tracing::trace!(
                         model = %self.cheap.model_name(),
                         "Smart routing: Moderate task -> cheap model (cascade enabled)"
                     );
@@ -913,7 +914,7 @@ impl LlmProvider for SmartRoutingProvider {
                     }
                 } else {
                     // Without cascade, moderate tasks go to cheap model
-                    tracing::debug!(
+                    tracing::trace!(
                         model = %self.cheap.model_name(),
                         "Smart routing: Moderate task -> cheap model (cascade disabled)"
                     );
@@ -931,7 +932,7 @@ impl LlmProvider for SmartRoutingProvider {
     ) -> Result<ToolCompletionResponse, LlmError> {
         self.stats.total_requests.fetch_add(1, Ordering::Relaxed);
         self.stats.primary_requests.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(
+        tracing::trace!(
             model = %self.primary.model_name(),
             "Smart routing: Tool use -> primary model (always)"
         );
@@ -944,6 +945,10 @@ impl LlmProvider for SmartRoutingProvider {
 
     async fn model_metadata(&self) -> Result<ModelMetadata, LlmError> {
         self.primary.model_metadata().await
+    }
+
+    fn effective_model_name(&self, requested_model: Option<&str>) -> String {
+        self.primary.effective_model_name(requested_model)
     }
 
     fn active_model_name(&self) -> String {
