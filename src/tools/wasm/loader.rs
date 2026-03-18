@@ -163,7 +163,7 @@ impl WasmToolLoader {
                             tool = name,
                             path = %cap_path.display(),
                             "Capabilities file missing \"description\" field; \
-                             tool will use generic fallback description"
+                             using WASM-exported description when available"
                         );
                     }
                     if params.is_none() && cap_file.parameters.is_none() {
@@ -171,7 +171,7 @@ impl WasmToolLoader {
                             tool = name,
                             path = %cap_path.display(),
                             "Capabilities file missing \"parameters\" field; \
-                             tool will accept any JSON object (permissive fallback)"
+                             using exported WASM schema when available"
                         );
                     }
                     (caps, oauth, desc, params)
@@ -186,7 +186,7 @@ impl WasmToolLoader {
                 tracing::warn!(
                     tool = name,
                     "No capabilities file for WASM tool; \
-                     tool will use generic fallback description and accept any JSON object"
+                     using default permissions and WASM-exported metadata when available"
                 );
                 (Capabilities::default(), None, None, None)
             };

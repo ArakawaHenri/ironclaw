@@ -493,6 +493,10 @@ struct WasmToolSchemas {
 }
 
 impl WasmToolSchemas {
+    /// Keep advertised schemas reasonably small because they are serialized
+    /// into the main tool list shown to the model.
+    const MAX_ADVERTISED_SCHEMA_BYTES: usize = 8 * 1024;
+
     fn permissive_schema() -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -521,9 +525,20 @@ impl WasmToolSchemas {
             .unwrap_or(0)
     }
 
+    fn should_advertise_discovery(schema: &serde_json::Value) -> bool {
+        Self::typed_property_count(schema) > 0
+            && schema.to_string().len() <= Self::MAX_ADVERTISED_SCHEMA_BYTES
+    }
+
     fn new(discovery: serde_json::Value) -> Self {
+        let advertised = if Self::should_advertise_discovery(&discovery) {
+            discovery.clone()
+        } else {
+            Self::permissive_schema()
+        };
+
         Self {
-            advertised: Self::permissive_schema(),
+            advertised,
             discovery,
         }
     }
@@ -1510,30 +1525,19 @@ mod tests {
         wrapper.schemas = super::WasmToolSchemas::new(discovery_schema.clone());
         wrapper.description = "Search documents".to_string();
 
-        // Advertised schema stays permissive; discovery holds the typed schema
-        assert_eq!(
-            wrapper.parameters_schema(),
-            serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": true
-            })
-        );
+        // Small typed exported schemas should be advertised directly so the
+        // model sees the actual required parameters.
+        assert_eq!(wrapper.parameters_schema(), discovery_schema);
         assert_eq!(wrapper.discovery_schema(), discovery_schema);
 
         // Raw description is clean — no tool_info hint baked in
         assert!(!wrapper.description().contains("tool_info"));
 
-        // But schema() composes the hint at display time when advertised is permissive
+        // When advertised is typed, schema() should not add a tool_info hint.
         let schema = wrapper.schema();
         assert!(
-            schema.description.contains("tool_info"),
-            "schema().description should contain tool_info hint: {}",
-            schema.description
-        );
-        assert!(
-            schema.description.contains("include_schema: true"),
-            "hint should mention include_schema: true: {}",
+            !schema.description.contains("tool_info"),
+            "schema().description should not contain tool_info hint when typed: {}",
             schema.description
         );
 
@@ -1563,6 +1567,51 @@ mod tests {
         assert!(
             !schema.description.contains("tool_info"),
             "schema().description should not contain tool_info hint when typed: {}",
+            schema.description
+        );
+    }
+
+    #[tokio::test]
+    async fn test_large_exported_schema_stays_permissive_for_advertising() {
+        let mut properties = serde_json::Map::new();
+        for i in 0..200 {
+            properties.insert(
+                format!("field_{i:03}"),
+                serde_json::json!({
+                    "type": "string",
+                    "description": "x".repeat(64)
+                }),
+            );
+        }
+        let discovery_schema = serde_json::json!({
+            "type": "object",
+            "properties": properties,
+        });
+
+        let runtime = Arc::new(WasmToolRuntime::new(WasmRuntimeConfig::for_testing()).unwrap());
+        let prepared = runtime
+            .prepare("search", b"\0asm\x0d\0\x01\0", None)
+            .await
+            .unwrap();
+        let mut wrapper =
+            super::WasmToolWrapper::new(Arc::clone(&runtime), prepared, Capabilities::default());
+        wrapper.schemas = super::WasmToolSchemas::new(discovery_schema.clone());
+        wrapper.description = "Search documents".to_string();
+
+        assert_eq!(
+            wrapper.parameters_schema(),
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": true
+            })
+        );
+        assert_eq!(wrapper.discovery_schema(), discovery_schema);
+
+        let schema = wrapper.schema();
+        assert!(
+            schema.description.contains("tool_info"),
+            "large schemas should still fall back to the tool_info hint: {}",
             schema.description
         );
     }
