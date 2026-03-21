@@ -915,18 +915,12 @@ impl Agent {
             if approved && always {
                 let tool_name = pending.tool_name.clone();
                 sess.auto_approve_tool(&tool_name);
-                tracing::info!(
-                    "Auto-approved tool '{}' for session {}",
-                    tool_name,
-                    sess.id
-                );
+                tracing::info!("Auto-approved tool '{}' for session {}", tool_name, sess.id);
             }
 
             // Set thread state to Processing for approved requests.
             // Re-borrow the thread since the previous borrow was dropped.
-            if approved
-                && let Some(thread) = sess.threads.get_mut(&thread_id)
-            {
+            if approved && let Some(thread) = sess.threads.get_mut(&thread_id) {
                 thread.state = ThreadState::Processing;
             }
 
@@ -2133,10 +2127,7 @@ mod tests {
 
         // Verify both mutations happened atomically
         assert!(session.is_tool_auto_approved("web_fetch"));
-        assert_eq!(
-            session.threads[&thread_id].state,
-            ThreadState::Processing
-        );
+        assert_eq!(session.threads[&thread_id].state, ThreadState::Processing);
         // Pending approval should be consumed (not restored)
         assert!(session.threads[&thread_id].pending_approval.is_none());
     }
