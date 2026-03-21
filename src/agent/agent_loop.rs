@@ -1010,7 +1010,7 @@ impl Agent {
                 thread_id = %external_thread_id,
                 "Hydrating thread from DB"
             );
-            if let Some(rejection) = self.maybe_hydrate_thread(message, external_thread_id).await {
+            if let Err(rejection) = self.maybe_hydrate_thread(message, external_thread_id).await {
                 return Ok(Some(format!("Error: {}", rejection)));
             }
         }
