@@ -61,15 +61,14 @@ impl ExecutionLoop {
         // Transition to Running
         self.thread.transition_to(ThreadState::Running, None)?;
 
-        // Inject system prompt if none exists
+        // Inject CodeAct/RLM system prompt if none exists
         if !self.thread.messages.iter().any(|m| m.role == crate::types::message::MessageRole::System) {
-            self.thread.messages.insert(
-                0,
-                ThreadMessage::system(
-                    "You are a helpful assistant. Use the available tools to accomplish the user's request. \
-                     Respond concisely.",
-                ),
-            );
+            // Get available actions for the prompt
+            let active_leases = self.leases.active_for_thread(self.thread.id).await;
+            let actions = self.effects.available_actions(&active_leases).await
+                .unwrap_or_default();
+            let system_prompt = crate::executor::prompt::build_codeact_system_prompt(&actions);
+            self.thread.messages.insert(0, ThreadMessage::system(system_prompt));
         }
 
         let max_iterations = self.thread.config.max_iterations;
@@ -163,7 +162,7 @@ impl ExecutionLoop {
             let active_leases = self.leases.active_for_thread(self.thread.id).await;
 
             // 5. Build context
-            let (messages, actions) =
+            let (messages, _actions) =
                 build_step_context(&self.thread.messages, &active_leases, &self.effects).await?;
 
             // 6. Create step
@@ -174,6 +173,10 @@ impl ExecutionLoop {
             });
 
             // 7. Call LLM
+            // CodeAct/RLM: send NO structured tool definitions — tools are described
+            // in the system prompt as Python functions. The LLM produces text with
+            // ```repl code blocks that the bridge detects and converts to LlmResponse::Code.
+            // This avoids the LLM using structured tool calls instead of writing code.
             let force_text = iteration >= max_iterations.saturating_sub(1);
             let config = LlmCallConfig {
                 force_text,
@@ -181,7 +184,7 @@ impl ExecutionLoop {
                 ..LlmCallConfig::default()
             };
 
-            let llm_output = self.llm.complete(&messages, &actions, &config).await?;
+            let llm_output = self.llm.complete(&messages, &[], &config).await?;
             step.tokens_used = llm_output.usage;
             self.thread.total_tokens_used += llm_output.usage.total();
             step.llm_response = Some(llm_output.response.clone());

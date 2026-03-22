@@ -102,7 +102,7 @@ impl LlmBackend for LlmBridgeAdapter {
                 reason: e.to_string(),
             })?;
 
-        // Convert response
+        // Convert response — check for code blocks (CodeAct/RLM pattern)
         let llm_response = if !response.tool_calls.is_empty() {
             LlmResponse::ActionCalls {
                 calls: response
@@ -117,7 +117,15 @@ impl LlmBackend for LlmBridgeAdapter {
                 content: response.content.clone(),
             }
         } else {
-            LlmResponse::Text(response.content.unwrap_or_default())
+            let text = response.content.unwrap_or_default();
+            // Detect ```repl or ```python fenced code blocks
+            match extract_code_block(&text) {
+                Some(code) => LlmResponse::Code {
+                    code,
+                    content: Some(text),
+                },
+                None => LlmResponse::Text(text),
+            }
         };
 
         Ok(LlmOutput {
@@ -180,4 +188,30 @@ fn action_def_to_tool_def(action: &ActionDef) -> ToolDefinition {
         description: action.description.clone(),
         parameters: action.parameters_schema.clone(),
     }
+}
+
+/// Extract Python code from ```repl or ```python fenced blocks.
+///
+/// Matches the pattern used by RLM implementations (fast-rlm uses ```repl,
+/// official RLM uses ```repl, some models output ```python).
+fn extract_code_block(text: &str) -> Option<String> {
+    // Try ```repl first (preferred), then ```python
+    for marker in ["```repl", "```python"] {
+        if let Some(start) = text.find(marker) {
+            let code_start = start + marker.len();
+            // Skip to next line
+            let code_start = text[code_start..]
+                .find('\n')
+                .map(|i| code_start + i + 1)
+                .unwrap_or(code_start);
+            // Find closing ```
+            if let Some(end) = text[code_start..].find("```") {
+                let code = text[code_start..code_start + end].trim();
+                if !code.is_empty() {
+                    return Some(code.to_string());
+                }
+            }
+        }
+    }
+    None
 }
