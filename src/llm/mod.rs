@@ -496,6 +496,19 @@ fn create_cheap_provider_for_backend(
         });
     }
 
+    if config.backend == "gemini_oauth" {
+        let Some(ref gemini_config) = config.gemini_oauth else {
+            return Err(LlmError::RequestFailed {
+                provider: "gemini_oauth".to_string(),
+                reason: "Gemini OAuth config not available for cheap model".to_string(),
+            });
+        };
+        let mut cheap_gemini_config = gemini_config.clone();
+        cheap_gemini_config.model = cheap_model.to_string();
+        let provider = GeminiOauthProvider::new(cheap_gemini_config)?;
+        return Ok(Some(Arc::new(provider)));
+    }
+
     // Registry-based provider: clone config and swap model
     let reg_config = config.provider.as_ref().ok_or_else(|| LlmError::RequestFailed {
         provider: config.backend.clone(),
@@ -801,6 +814,30 @@ mod tests {
         assert!(
             result.is_err(),
             "Bedrock should return an error for cheap model"
+        );
+    }
+
+    #[test]
+    fn test_create_cheap_llm_provider_gemini_oauth_creates_provider() {
+        let mut config = test_llm_config();
+        config.backend = "gemini_oauth".to_string();
+        config.cheap_model = Some("gemini-2.5-flash-lite".to_string());
+        config.gemini_oauth = Some(crate::config::GeminiOauthConfig {
+            model: "gemini-2.5-pro".to_string(),
+            credentials_path: std::path::PathBuf::from("/tmp/nonexistent-creds.json"),
+        });
+
+        let session = Arc::new(SessionManager::new(SessionConfig::default()));
+        let result = create_cheap_llm_provider(&config, session);
+
+        // Should succeed and return a provider (credentials validation is deferred
+        // until the first LLM call, not at construction time).
+        let provider = result.expect("gemini_oauth cheap provider should succeed");
+        assert!(provider.is_some(), "Should return Some(provider)");
+        assert_eq!(
+            provider.unwrap().model_name(),
+            "gemini-2.5-flash-lite",
+            "Cheap provider should use the overridden model name"
         );
     }
 
