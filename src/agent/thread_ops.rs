@@ -141,7 +141,8 @@ impl Agent {
             sess.id
         };
 
-        let mut thread = crate::agent::session::Thread::with_id(thread_uuid, session_id, None);
+        let mut thread =
+            crate::agent::session::Thread::with_id(thread_uuid, session_id, Some(&message.channel));
         if !chat_messages.is_empty() {
             thread.restore_from_messages(chat_messages);
         }

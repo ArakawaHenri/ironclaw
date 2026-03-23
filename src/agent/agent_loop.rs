@@ -731,6 +731,8 @@ impl Agent {
             {
                 use crate::agent::session::Thread;
                 let mut sess = session.lock().await;
+                // Bootstrap thread has no incoming message -- use None for
+                // source_channel so approvals from any channel are permitted.
                 let thread = Thread::with_id(id, sess.id, None);
                 sess.active_thread = Some(id);
                 sess.threads.entry(id).or_insert(thread);
@@ -1037,10 +1039,11 @@ impl Agent {
                 .await;
             let mut sess = session.lock().await;
             if let Some(thread) = sess.threads.get(&target_thread_id) {
-                let authorized = thread
-                    .source_channel
-                    .as_ref()
-                    .is_none_or(|src| src == &message.channel || message.channel == "web");
+                let authorized = thread.source_channel.as_ref().map_or(true, |src| {
+                    src == &message.channel
+                        || message.channel == "web"
+                        || message.channel == "gateway"
+                });
                 if !authorized {
                     tracing::warn!(
                         %target_thread_id,
