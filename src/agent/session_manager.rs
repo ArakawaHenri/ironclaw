@@ -929,9 +929,13 @@ mod tests {
         let manager = SessionManager::new();
 
         // Case 1: Normal resolution creates thread and maps it
-        let (session1, tid1) = manager.resolve_thread("user1", "chan1", Some("ext-1")).await;
+        let (session1, tid1) = manager
+            .resolve_thread("user1", "chan1", Some("ext-1"))
+            .await;
         // Resolving again with same key should return same thread (fast path)
-        let (_, tid1_again) = manager.resolve_thread("user1", "chan1", Some("ext-1")).await;
+        let (_, tid1_again) = manager
+            .resolve_thread("user1", "chan1", Some("ext-1"))
+            .await;
         assert_eq!(tid1, tid1_again);
 
         // Case 2: UUID adoption - insert a thread directly into session
