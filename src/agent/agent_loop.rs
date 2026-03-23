@@ -1039,7 +1039,7 @@ impl Agent {
                 .await;
             let mut sess = session.lock().await;
             if let Some(thread) = sess.threads.get(&target_thread_id) {
-                let authorized = thread.source_channel.as_ref().map_or(true, |src| {
+                let authorized = thread.source_channel.as_ref().is_none_or(|src| {
                     src == &message.channel
                         || message.channel == "web"
                         || message.channel == "gateway"
