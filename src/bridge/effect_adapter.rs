@@ -39,11 +39,21 @@ impl EffectExecutor for EffectBridgeAdapter {
             format!("Thread {}", context.thread_id),
         );
 
+        // Convert Python identifier (underscores) back to tool name (hyphens).
+        // Python can't have hyphens in function names, so the system prompt
+        // lists tools with underscores. We need to try both forms.
+        let hyphenated = action_name.replace('_', "-");
+        let lookup_name = if self.tools.get(action_name).await.is_some() {
+            action_name
+        } else {
+            &hyphenated
+        };
+
         // Execute through the existing tool pipeline
         let result = crate::tools::execute::execute_tool_with_safety(
             &self.tools,
             &self.safety,
-            action_name,
+            lookup_name,
             &parameters,
             &job_ctx,
         )
@@ -75,7 +85,8 @@ impl EffectExecutor for EffectBridgeAdapter {
         Ok(tool_defs
             .into_iter()
             .map(|td| ActionDef {
-                name: td.name,
+                // Convert hyphens to underscores for valid Python identifiers
+                name: td.name.replace('-', "_"),
                 description: td.description,
                 parameters_schema: td.parameters,
                 effects: vec![], // Effect classification happens at the engine level

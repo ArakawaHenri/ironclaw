@@ -75,7 +75,7 @@ async fn get_or_init_engine(agent: &Agent) -> Result<(), Error> {
             actions: tool_defs
                 .into_iter()
                 .map(|td| ironclaw_engine::ActionDef {
-                    name: td.name,
+                    name: td.name.replace('-', "_"),
                     description: td.description,
                     parameters_schema: td.parameters,
                     effects: vec![],
