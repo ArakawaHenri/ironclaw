@@ -960,9 +960,10 @@ impl Agent {
         {
             let sess = session.lock().await;
             if let Some(thread) = sess.threads.get(&thread_id) {
-                let authorized = thread.source_channel.as_ref().is_none_or(|src| {
-                    src == &message.channel || message.channel == "web"
-                });
+                let authorized = thread
+                    .source_channel
+                    .as_ref()
+                    .is_none_or(|src| src == &message.channel || message.channel == "web");
                 if !authorized {
                     tracing::warn!(
                         %thread_id,
