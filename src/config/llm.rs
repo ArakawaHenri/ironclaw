@@ -75,6 +75,17 @@ impl LlmConfig {
             custom_providers_count = settings.llm_custom_providers.len(),
             "Resolving LLM backend"
         );
+        // Warn operators when a DB-persisted value silently overrides LLM_BACKEND.
+        if backend_source == "db:llm_backend"
+            && let Ok(Some(env_val)) = optional_env("LLM_BACKEND")
+        {
+            tracing::warn!(
+                db_value = %backend,
+                env_value = %env_val,
+                "LLM_BACKEND env var is set but DB setting takes priority. \
+                 Unset llm_backend in the DB (via settings UI) to use the env var."
+            );
+        }
 
         // Validate the backend is known
         let backend_lower = backend.to_lowercase();
@@ -1353,8 +1364,16 @@ mod tests {
 
     #[test]
     fn db_llm_backend_takes_priority_over_env_var() {
-        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
-        // SAFETY: Under ENV_MUTEX.
+        let _guard = lock_env();
+        // SAFETY: Under ENV_MUTEX. RAII guard removes LLM_BACKEND on drop so
+        // a panicking assertion cannot leak the env var to other tests.
+        struct RemoveOnDrop(&'static str);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var(self.0) };
+            }
+        }
+        let _cleanup = RemoveOnDrop("LLM_BACKEND");
         unsafe {
             std::env::set_var("LLM_BACKEND", "nearai");
             std::env::remove_var("LLM_MODEL");
@@ -1379,10 +1398,6 @@ mod tests {
             cfg.backend, "myprovider",
             "DB setting should override LLM_BACKEND env var"
         );
-        // SAFETY: Under ENV_MUTEX.
-        unsafe {
-            std::env::remove_var("LLM_BACKEND");
-        }
     }
 
     // ── OpenAI Codex tests ──────────────────────────────────────────

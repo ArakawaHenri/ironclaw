@@ -6084,6 +6084,9 @@ document.addEventListener('keydown', function(e) {
   if (e.key === 'Escape' && document.getElementById('confirm-modal').style.display === 'flex') {
     closeConfirmModal();
   }
+  if (e.key === 'Escape' && document.getElementById('provider-dialog').style.display === 'flex') {
+    resetProviderForm();
+  }
 });
 
 // --- Settings Import/Export ---
@@ -6195,8 +6198,8 @@ function apiFetchVoid(path, options) {
 // Fields: id, name, adapter, base_url, builtin, default_model, api_key_required, can_list_models
 // nearai/bedrock use special auth flows — no Configure button (api_key_required=false, can_list_models=false)
 const BUILTIN_PROVIDERS = [
-  { id: 'nearai',            name: 'NEAR AI',           adapter: 'nearai',                base_url: 'https://private-chat-stg.near.ai/v1',                                    builtin: true, default_model: 'zai-org/GLM-5-FP8',                                              api_key_required: true,  can_list_models: true  },
-  { id: 'openai',            name: 'OpenAI',            adapter: 'open_ai_completions',   base_url: 'https://api.openai.com/v1',                                builtin: true, default_model: 'gpt-5-mini',                                    api_key_required: true,  can_list_models: true  },
+  { id: 'nearai',            name: 'NEAR AI',           adapter: 'nearai',                base_url: 'https://cloud-api.near.ai/v1',                                    builtin: true, default_model: 'zai-org/GLM-5-FP8',                                              api_key_required: true,  can_list_models: true  },
+  { id: 'openai',            name: 'OpenAI',            adapter: 'open_ai_completions',   base_url: 'https://api.openai.com/v1',                                builtin: true, default_model: 'gpt-4o-mini',                                   api_key_required: true,  can_list_models: true  },
   { id: 'anthropic',         name: 'Anthropic',         adapter: 'anthropic',             base_url: 'https://api.anthropic.com',                                builtin: true, default_model: 'claude-sonnet-4-20250514',                       api_key_required: true,  can_list_models: true  },
   { id: 'ollama',            name: 'Ollama',            adapter: 'ollama',                base_url: 'http://localhost:11434',                                    builtin: true, default_model: 'llama3',                                        api_key_required: false, can_list_models: true  },
   { id: 'openai_compatible', name: 'OpenAI Compatible', adapter: 'open_ai_completions',   base_url: '',                                                         builtin: true, default_model: 'default',                                       api_key_required: false, can_list_models: false },
@@ -6296,37 +6299,37 @@ function renderProviders() {
       ? '<span class="provider-badge provider-badge-builtin">' + I18n.t('config.builtin') + '</span>'
       : '';
     const deleteBtn = !p.builtin && !isActive
-      ? '<button class="provider-action-btn provider-delete-btn" data-action="delete-custom-provider" data-id="' + escHtml(p.id) + '">' + I18n.t('common.delete') + '</button>'
+      ? '<button class="provider-action-btn provider-delete-btn" data-action="delete-custom-provider" data-id="' + escapeHtml(p.id) + '">' + I18n.t('common.delete') + '</button>'
       : '';
     const editBtn = !p.builtin
-      ? '<button class="provider-action-btn" data-action="edit-custom-provider" data-id="' + escHtml(p.id) + '">' + I18n.t('common.edit') + '</button>'
+      ? '<button class="provider-action-btn" data-action="edit-custom-provider" data-id="' + escapeHtml(p.id) + '">' + I18n.t('common.edit') + '</button>'
       : '';
     // Show Configure for built-in providers that support it (not bedrock — uses AWS credential chain)
     const configureBtn = p.builtin && p.id !== 'bedrock'
-      ? '<button class="provider-action-btn" data-action="configure-builtin-provider" data-id="' + escHtml(p.id) + '">' + I18n.t('config.configureProvider') + '</button>'
+      ? '<button class="provider-action-btn" data-action="configure-builtin-provider" data-id="' + escapeHtml(p.id) + '">' + I18n.t('config.configureProvider') + '</button>'
       : '';
     const useBtn = !isActive
-      ? '<button class="provider-action-btn" data-action="set-active-provider" data-id="' + escHtml(p.id) + '">' + I18n.t('config.useProvider') + '</button>'
+      ? '<button class="provider-action-btn" data-action="set-active-provider" data-id="' + escapeHtml(p.id) + '">' + I18n.t('config.useProvider') + '</button>'
       : '';
     const baseUrlText = p.base_url
-      ? '<span class="provider-url">' + escHtml(p.base_url) + '</span>'
+      ? '<span class="provider-url">' + escapeHtml(p.base_url) + '</span>'
       : '';
     // Show configured model: for active provider use _selectedModel, for others check _builtinOverrides
     const displayModel = isActive
       ? _selectedModel
       : (p.builtin && _builtinOverrides[p.id] ? (_builtinOverrides[p.id].model || '') : '');
     const modelText = displayModel
-      ? '<span class="provider-current-model">' + escHtml(I18n.t('config.currentModel', { model: displayModel })) + '</span>'
+      ? '<span class="provider-current-model">' + escapeHtml(I18n.t('config.currentModel', { model: displayModel })) + '</span>'
       : '';
 
     return '<div class="provider-card' + (isActive ? ' provider-card-active' : '') + '">'
       + '<div class="provider-card-header">'
-      +   '<span class="provider-name">' + escHtml(p.name || p.id) + '</span>'
-      +   '<span class="provider-id-label">' + escHtml(p.id) + '</span>'
+      +   '<span class="provider-name">' + escapeHtml(p.name || p.id) + '</span>'
+      +   '<span class="provider-id-label">' + escapeHtml(p.id) + '</span>'
       +   activeBadge + builtinBadge
       + '</div>'
       + '<div class="provider-card-meta">'
-      +   '<span class="provider-adapter">' + escHtml(adapterLabel) + '</span>'
+      +   '<span class="provider-adapter">' + escapeHtml(adapterLabel) + '</span>'
       +   baseUrlText
       +   modelText
       + '</div>'
@@ -6335,10 +6338,6 @@ function renderProviders() {
       + '</div>'
       + '</div>';
   }).join('');
-}
-
-function escHtml(s) {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 function setActiveProvider(id) {
@@ -6678,7 +6677,7 @@ document.getElementById('fetch-models-btn').addEventListener('click', () => {
       if (data.ok && data.models && data.models.length > 0) {
         const currentModel = document.getElementById('provider-model').value;
         select.innerHTML = data.models
-          .map((m) => `<option value="${escHtml(m)}"${m === currentModel ? ' selected' : ''}>${escHtml(m)}</option>`)
+          .map((m) => `<option value="${escapeHtml(m)}"${m === currentModel ? ' selected' : ''}>${escapeHtml(m)}</option>`)
           .join('');
         select.style.display = '';
         btn.style.display = 'none';

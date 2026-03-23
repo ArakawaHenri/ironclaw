@@ -51,6 +51,7 @@ use crate::channels::web::log_layer::LogBroadcaster;
 use crate::channels::web::sse::SseManager;
 use crate::channels::web::types::*;
 use crate::channels::web::util::{build_turns_from_db_messages, truncate_preview};
+use crate::config::helpers::validate_base_url;
 use crate::db::Database;
 use crate::extensions::ExtensionManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
@@ -2524,6 +2525,13 @@ async fn llm_test_connection_handler(
 }
 
 async fn test_provider_connection(req: TestConnectionRequest) -> TestConnectionResponse {
+    if let Err(e) = validate_base_url(&req.base_url, "base_url") {
+        return TestConnectionResponse {
+            ok: false,
+            message: format!("Invalid base URL: {e}"),
+        };
+    }
+
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -2662,6 +2670,14 @@ async fn llm_list_models_handler(Json(body): Json<ListModelsRequest>) -> Json<Li
 }
 
 async fn fetch_provider_models(req: ListModelsRequest) -> ListModelsResponse {
+    if let Err(e) = validate_base_url(&req.base_url, "base_url") {
+        return ListModelsResponse {
+            ok: false,
+            models: vec![],
+            message: format!("Invalid base URL: {e}"),
+        };
+    }
+
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
