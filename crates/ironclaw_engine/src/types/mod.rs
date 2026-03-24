@@ -9,6 +9,7 @@ pub mod error;
 pub mod event;
 pub mod memory;
 pub mod message;
+pub mod mission;
 pub mod project;
 pub mod provenance;
 pub mod step;

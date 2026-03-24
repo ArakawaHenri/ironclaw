@@ -139,6 +139,8 @@ pub struct TokenUsage {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    /// USD cost for this call (populated by LlmBackend if cost data is available).
+    pub cost_usd: f64,
 }
 
 impl TokenUsage {

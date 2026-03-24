@@ -10,6 +10,7 @@ use tokio::sync::RwLock;
 use ironclaw_engine::{
     CapabilityLease, DocId, EngineError, LeaseId, MemoryDoc, Project, ProjectId, Step, Thread,
     ThreadEvent, ThreadId, ThreadState, Store,
+    types::mission::{Mission, MissionId, MissionStatus},
 };
 
 /// In-memory implementation of the engine's `Store` trait.
@@ -23,6 +24,7 @@ pub struct InMemoryStore {
     projects: RwLock<HashMap<ProjectId, Project>>,
     docs: RwLock<HashMap<DocId, MemoryDoc>>,
     leases: RwLock<HashMap<LeaseId, CapabilityLease>>,
+    missions: RwLock<HashMap<MissionId, Mission>>,
 }
 
 impl InMemoryStore {
@@ -34,6 +36,7 @@ impl InMemoryStore {
             projects: RwLock::new(HashMap::new()),
             docs: RwLock::new(HashMap::new()),
             leases: RwLock::new(HashMap::new()),
+            missions: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -181,6 +184,28 @@ impl Store for InMemoryStore {
     async fn revoke_lease(&self, lease_id: LeaseId, _reason: &str) -> Result<(), EngineError> {
         if let Some(lease) = self.leases.write().await.get_mut(&lease_id) {
             lease.revoked = true;
+        }
+        Ok(())
+    }
+
+    // ── Mission ──────────────────────────────────────────────
+
+    async fn save_mission(&self, mission: &Mission) -> Result<(), EngineError> {
+        self.missions.write().await.insert(mission.id, mission.clone());
+        Ok(())
+    }
+
+    async fn load_mission(&self, id: MissionId) -> Result<Option<Mission>, EngineError> {
+        Ok(self.missions.read().await.get(&id).cloned())
+    }
+
+    async fn list_missions(&self, project_id: ProjectId) -> Result<Vec<Mission>, EngineError> {
+        Ok(self.missions.read().await.values().filter(|m| m.project_id == project_id).cloned().collect())
+    }
+
+    async fn update_mission_status(&self, id: MissionId, status: MissionStatus) -> Result<(), EngineError> {
+        if let Some(mission) = self.missions.write().await.get_mut(&id) {
+            mission.status = status;
         }
         Ok(())
     }

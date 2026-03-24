@@ -7,6 +7,7 @@
 use crate::types::capability::{
     ActionDef, CapabilityLease, EffectType, PolicyCondition, PolicyEffect, PolicyRule,
 };
+use crate::types::provenance::Provenance;
 
 /// The result of a policy evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,7 +26,7 @@ pub enum PolicyDecision {
 pub struct PolicyEngine {
     global_policies: Vec<PolicyRule>,
     /// Effect types that are always denied unless explicitly overridden.
-    denied_effects: Vec<EffectType>,
+    pub(crate) denied_effects: Vec<EffectType>,
 }
 
 impl PolicyEngine {
@@ -101,6 +102,57 @@ impl PolicyEngine {
                 PolicyEffect::RequireApproval,
                 "action requires approval",
             );
+        }
+
+        decision
+    }
+
+    /// Evaluate with provenance-aware taint checking.
+    ///
+    /// Extends the base evaluation with provenance-based rules:
+    /// - `LlmGenerated` data + `Financial` effect → RequireApproval
+    /// - `LlmGenerated` data + `WriteExternal` effect → RequireApproval
+    /// - `ToolOutput` data + `Financial` effect → RequireApproval
+    pub fn evaluate_with_provenance(
+        &self,
+        action: &ActionDef,
+        lease: &CapabilityLease,
+        capability_policies: &[PolicyRule],
+        provenance: &Provenance,
+    ) -> PolicyDecision {
+        let mut decision = self.evaluate(action, lease, capability_policies);
+
+        // Provenance-based taint rules
+        match provenance {
+            Provenance::LlmGenerated => {
+                if action.effects.contains(&EffectType::Financial) {
+                    decision = merge_decision(
+                        decision,
+                        PolicyEffect::RequireApproval,
+                        "LLM-generated data cannot trigger financial effects without approval",
+                    );
+                }
+                if action.effects.contains(&EffectType::WriteExternal) {
+                    decision = merge_decision(
+                        decision,
+                        PolicyEffect::RequireApproval,
+                        "LLM-generated data requires approval for external writes",
+                    );
+                }
+            }
+            Provenance::ToolOutput { .. } => {
+                if action.effects.contains(&EffectType::Financial) {
+                    decision = merge_decision(
+                        decision,
+                        PolicyEffect::RequireApproval,
+                        "tool output data requires approval for financial effects",
+                    );
+                }
+            }
+            // User and System provenance are trusted
+            Provenance::User | Provenance::System => {}
+            // Reflection and MemoryRetrieval are internal, treat as trusted
+            Provenance::Reflection { .. } | Provenance::MemoryRetrieval { .. } => {}
         }
 
         decision
@@ -255,6 +307,62 @@ mod tests {
             engine.evaluate(&action, &lease, &[]),
             PolicyDecision::Deny { .. }
         ));
+    }
+
+    #[test]
+    fn llm_generated_financial_requires_approval() {
+        let engine = PolicyEngine::new();
+        let action = make_action("transfer_funds", vec![EffectType::Financial], false);
+        let lease = make_lease();
+        let decision = engine.evaluate_with_provenance(
+            &action,
+            &lease,
+            &[],
+            &Provenance::LlmGenerated,
+        );
+        assert!(matches!(decision, PolicyDecision::RequireApproval { .. }));
+    }
+
+    #[test]
+    fn llm_generated_write_external_requires_approval() {
+        let engine = PolicyEngine::new();
+        let action = make_action("post_message", vec![EffectType::WriteExternal], false);
+        let lease = make_lease();
+        let decision = engine.evaluate_with_provenance(
+            &action,
+            &lease,
+            &[],
+            &Provenance::LlmGenerated,
+        );
+        assert!(matches!(decision, PolicyDecision::RequireApproval { .. }));
+    }
+
+    #[test]
+    fn user_provenance_allows_financial() {
+        let engine = PolicyEngine::new();
+        let action = make_action("transfer_funds", vec![EffectType::Financial], false);
+        let lease = make_lease();
+        let decision = engine.evaluate_with_provenance(
+            &action,
+            &lease,
+            &[],
+            &Provenance::User,
+        );
+        assert_eq!(decision, PolicyDecision::Allow);
+    }
+
+    #[test]
+    fn tool_output_financial_requires_approval() {
+        let engine = PolicyEngine::new();
+        let action = make_action("pay_invoice", vec![EffectType::Financial], false);
+        let lease = make_lease();
+        let decision = engine.evaluate_with_provenance(
+            &action,
+            &lease,
+            &[],
+            &Provenance::ToolOutput { action_name: "scrape_invoices".into() },
+        );
+        assert!(matches!(decision, PolicyDecision::RequireApproval { .. }));
     }
 
     #[test]

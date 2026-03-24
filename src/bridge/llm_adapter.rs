@@ -92,6 +92,7 @@ impl LlmBackend for LlmBridgeAdapter {
                     output_tokens: u64::from(response.output_tokens),
                     cache_read_tokens: u64::from(response.cache_read_input_tokens),
                     cache_write_tokens: u64::from(response.cache_creation_input_tokens),
+                    cost_usd: 0.0,
                 },
             });
         }
@@ -144,6 +145,7 @@ impl LlmBackend for LlmBridgeAdapter {
                 output_tokens: u64::from(response.output_tokens),
                 cache_read_tokens: u64::from(response.cache_read_input_tokens),
                 cache_write_tokens: u64::from(response.cache_creation_input_tokens),
+                cost_usd: 0.0, // TODO: populate from provider cost data when available
             },
         })
     }

@@ -161,47 +161,80 @@ impl ThreadManager {
         // Spawn background task
         let store_for_task = Arc::clone(&self.store);
         let llm_for_reflection = Arc::clone(&self.llm);
+        let caps_for_reflection = Arc::clone(&self.capabilities);
+        let event_tx = self.event_tx.clone();
         let handle = tokio::spawn(async move {
             let mut exec = exec_loop;
             let result = exec.run().await;
             debug!(thread_id = %thread_id, "thread execution finished");
 
+            // Helper to emit events on both the thread and broadcast channel
+            let emit = |thread: &mut crate::types::thread::Thread, kind: crate::types::event::EventKind| {
+                let event = crate::types::event::ThreadEvent::new(thread.id, kind);
+                let _ = event_tx.send(event.clone());
+                thread.events.push(event);
+                thread.updated_at = chrono::Utc::now();
+            };
+
             // Run retrospective trace analysis (non-LLM, always runs)
-            let trace = crate::executor::trace::build_trace(&exec.thread);
+            let mut trace = crate::executor::trace::build_trace(&exec.thread);
             if !trace.issues.is_empty() {
                 crate::executor::trace::log_trace_summary(&trace);
             }
 
-            // Write trace file if enabled
-            if crate::executor::trace::is_trace_enabled() {
-                crate::executor::trace::write_trace(&trace);
-            }
-
             // Run LLM reflection if enabled and thread completed
             if exec.thread.config.enable_reflection
-                && (exec.thread.state == crate::types::thread::ThreadState::Completed
-                    || exec.thread.state == crate::types::thread::ThreadState::Done)
+                && exec.thread.state == crate::types::thread::ThreadState::Completed
             {
-                debug!(thread_id = %thread_id, "running reflection pipeline");
-                match crate::reflection::reflect(&exec.thread, &llm_for_reflection).await {
-                    Ok(reflection) => {
-                        debug!(
-                            thread_id = %thread_id,
-                            docs = reflection.docs.len(),
-                            tokens = reflection.tokens_used.total(),
-                            "reflection complete"
-                        );
-                        for doc in &reflection.docs {
-                            let _ = store_for_task.save_memory_doc(doc).await;
+                // Transition: Completed → Reflecting
+                if let Err(e) = exec.thread.transition_to(
+                    crate::types::thread::ThreadState::Reflecting,
+                    Some("starting reflection".into()),
+                ) {
+                    tracing::warn!(thread_id = %thread_id, "failed to transition to Reflecting: {e}");
+                } else {
+                    emit(&mut exec.thread, crate::types::event::EventKind::ReflectionStarted);
+
+                    match crate::reflection::reflect(&exec.thread, &llm_for_reflection, &store_for_task, &caps_for_reflection).await {
+                        Ok(reflection) => {
+                            let doc_types: Vec<String> = reflection
+                                .docs
+                                .iter()
+                                .map(|d| format!("{:?}", d.doc_type))
+                                .collect();
+
+                            emit(&mut exec.thread, crate::types::event::EventKind::ReflectionComplete {
+                                docs_produced: reflection.docs.len(),
+                                doc_types,
+                                tokens_used: reflection.tokens_used.total(),
+                            });
+
+                            // Attach reflection results to the trace
+                            crate::executor::trace::attach_reflection(&mut trace, &reflection);
+
+                            for doc in &reflection.docs {
+                                let _ = store_for_task.save_memory_doc(doc).await;
+                            }
+                        }
+                        Err(e) => {
+                            emit(&mut exec.thread, crate::types::event::EventKind::ReflectionFailed {
+                                error: e.to_string(),
+                            });
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            thread_id = %thread_id,
-                            "reflection failed: {e}"
-                        );
-                    }
+
+                    // Transition: Reflecting → Done
+                    let _ = exec.thread.transition_to(
+                        crate::types::thread::ThreadState::Done,
+                        Some("reflection finished".into()),
+                    );
                 }
+            }
+
+            // Write trace file if enabled (after reflection, so it's included)
+            if crate::executor::trace::is_trace_enabled() {
+                crate::executor::trace::log_trace_summary(&trace);
+                crate::executor::trace::write_trace(&trace);
             }
 
             // Save final thread state to store
@@ -411,6 +444,10 @@ mod tests {
         async fn save_lease(&self, _: &CapabilityLease) -> Result<(), EngineError> { Ok(()) }
         async fn load_active_leases(&self, _: ThreadId) -> Result<Vec<CapabilityLease>, EngineError> { Ok(vec![]) }
         async fn revoke_lease(&self, _: crate::types::capability::LeaseId, _: &str) -> Result<(), EngineError> { Ok(()) }
+        async fn save_mission(&self, _: &crate::types::mission::Mission) -> Result<(), EngineError> { Ok(()) }
+        async fn load_mission(&self, _: crate::types::mission::MissionId) -> Result<Option<crate::types::mission::Mission>, EngineError> { Ok(None) }
+        async fn list_missions(&self, _: ProjectId) -> Result<Vec<crate::types::mission::Mission>, EngineError> { Ok(vec![]) }
+        async fn update_mission_status(&self, _: crate::types::mission::MissionId, _: crate::types::mission::MissionStatus) -> Result<(), EngineError> { Ok(()) }
     }
 
     fn make_manager(llm: Arc<dyn LlmBackend>) -> ThreadManager {

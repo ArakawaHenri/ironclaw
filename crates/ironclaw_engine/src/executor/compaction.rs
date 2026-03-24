@@ -101,7 +101,7 @@ pub async fn compact_messages(
         compacted.push(sys);
     }
     compacted.push(ThreadMessage::assistant(summary_text.clone()));
-    compacted.push(ThreadMessage::system(format!(
+    compacted.push(ThreadMessage::user(format!(
         "Your conversation has been compacted {n} time(s). \
          The summary above captures your progress. Continue working on the task.",
         n = compaction_count + 1,

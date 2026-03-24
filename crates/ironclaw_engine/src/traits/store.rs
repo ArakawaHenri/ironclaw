@@ -7,6 +7,7 @@ use crate::types::capability::{CapabilityLease, LeaseId};
 use crate::types::error::EngineError;
 use crate::types::event::ThreadEvent;
 use crate::types::memory::{DocId, MemoryDoc};
+use crate::types::mission::{Mission, MissionId, MissionStatus};
 use crate::types::project::{Project, ProjectId};
 use crate::types::step::Step;
 use crate::types::thread::{Thread, ThreadId, ThreadState};
@@ -54,4 +55,15 @@ pub trait Store: Send + Sync {
         thread_id: ThreadId,
     ) -> Result<Vec<CapabilityLease>, EngineError>;
     async fn revoke_lease(&self, lease_id: LeaseId, reason: &str) -> Result<(), EngineError>;
+
+    // ── Mission operations ───────────────────────────────────
+
+    async fn save_mission(&self, mission: &Mission) -> Result<(), EngineError>;
+    async fn load_mission(&self, id: MissionId) -> Result<Option<Mission>, EngineError>;
+    async fn list_missions(&self, project_id: ProjectId) -> Result<Vec<Mission>, EngineError>;
+    async fn update_mission_status(
+        &self,
+        id: MissionId,
+        status: MissionStatus,
+    ) -> Result<(), EngineError>;
 }

@@ -33,23 +33,26 @@ pub async fn build_step_context(
 
     let mut ctx_messages = messages.to_vec();
 
-    // Inject retrieved memory docs as context
+    // Inject retrieved memory docs into the existing system prompt.
+    // Many providers require all system messages at the beginning (or a single
+    // system message), so we append to the first system message rather than
+    // inserting a separate one.
     if let Some(engine) = retrieval {
         let docs = engine
             .retrieve_context(project_id, goal, MAX_CONTEXT_DOCS)
             .await?;
         if !docs.is_empty() {
-            let context_msg = format_docs_as_context(&docs);
-            // Insert after the system prompt (index 1) if one exists,
-            // otherwise prepend.
-            let insert_pos = if !ctx_messages.is_empty()
+            let context_section = format_docs_as_context(&docs);
+            if !ctx_messages.is_empty()
                 && ctx_messages[0].role == crate::types::message::MessageRole::System
             {
-                1
+                // Append to existing system prompt
+                ctx_messages[0].content.push_str("\n\n");
+                ctx_messages[0].content.push_str(&context_section);
             } else {
-                0
-            };
-            ctx_messages.insert(insert_pos, ThreadMessage::system(context_msg));
+                // No system message — prepend as one
+                ctx_messages.insert(0, ThreadMessage::system(context_section));
+            }
         }
     }
 
@@ -141,6 +144,10 @@ mod tests {
         async fn save_lease(&self, _: &CapabilityLease) -> Result<(), EngineError> { Ok(()) }
         async fn load_active_leases(&self, _: ThreadId) -> Result<Vec<CapabilityLease>, EngineError> { Ok(vec![]) }
         async fn revoke_lease(&self, _: LeaseId, _: &str) -> Result<(), EngineError> { Ok(()) }
+        async fn save_mission(&self, _: &crate::types::mission::Mission) -> Result<(), EngineError> { Ok(()) }
+        async fn load_mission(&self, _: crate::types::mission::MissionId) -> Result<Option<crate::types::mission::Mission>, EngineError> { Ok(None) }
+        async fn list_missions(&self, _: ProjectId) -> Result<Vec<crate::types::mission::Mission>, EngineError> { Ok(vec![]) }
+        async fn update_mission_status(&self, _: crate::types::mission::MissionId, _: crate::types::mission::MissionStatus) -> Result<(), EngineError> { Ok(()) }
     }
 
     #[tokio::test]
@@ -168,14 +175,14 @@ mod tests {
         .await
         .unwrap();
 
-        // Should have 3 messages: system prompt, injected context, user message
-        assert_eq!(ctx_msgs.len(), 3);
+        // Should have 2 messages: system prompt (with docs appended), user message
+        assert_eq!(ctx_msgs.len(), 2);
         assert_eq!(ctx_msgs[0].role, crate::types::message::MessageRole::System);
-        assert_eq!(ctx_msgs[1].role, crate::types::message::MessageRole::System);
-        assert!(ctx_msgs[1].content.contains("Prior Knowledge"));
-        assert!(ctx_msgs[1].content.contains("LESSON"));
-        assert!(ctx_msgs[1].content.contains("web-search"));
-        assert_eq!(ctx_msgs[2].role, crate::types::message::MessageRole::User);
+        assert!(ctx_msgs[0].content.contains("You are an assistant."));
+        assert!(ctx_msgs[0].content.contains("Prior Knowledge"));
+        assert!(ctx_msgs[0].content.contains("LESSON"));
+        assert!(ctx_msgs[0].content.contains("web-search"));
+        assert_eq!(ctx_msgs[1].role, crate::types::message::MessageRole::User);
     }
 
     #[tokio::test]

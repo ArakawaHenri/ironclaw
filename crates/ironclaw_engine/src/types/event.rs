@@ -121,4 +121,15 @@ pub enum EventKind {
         call_id: String,
         approved: bool,
     },
+
+    // ── Reflection ───────────────────────────────────────────
+    ReflectionStarted,
+    ReflectionComplete {
+        docs_produced: usize,
+        doc_types: Vec<String>,
+        tokens_used: u64,
+    },
+    ReflectionFailed {
+        error: String,
+    },
 }

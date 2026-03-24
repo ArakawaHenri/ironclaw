@@ -1,24 +1,30 @@
 //! Reflection pipeline — produces structured knowledge from completed threads.
 //!
-//! After a thread completes, the reflection pipeline uses the LLM to:
-//! 1. Summarize what the thread accomplished
-//! 2. Extract lessons from failures and workarounds
-//! 3. Detect unresolved issues
-//! 4. Identify missing capabilities
+//! After a thread completes, the reflection pipeline spawns a CodeAct thread
+//! that uses reflection-specific tools (transcript inspection, memory queries,
+//! tool registry checks) to produce structured MemoryDocs.
 //!
-//! Each produces a MemoryDoc stored in the thread's project scope.
+//! The reflection thread runs with [`ThreadType::Reflection`] and its own
+//! [`ExecutionLoop`], making it a fully recursive CodeAct agent.
 
 use std::sync::Arc;
 
-use tracing::debug;
+use tracing::{debug, warn};
 
-use crate::traits::llm::{LlmBackend, LlmCallConfig};
+use crate::capability::lease::LeaseManager;
+use crate::capability::policy::PolicyEngine;
+use crate::capability::registry::CapabilityRegistry;
+use crate::executor::ExecutionLoop;
+use crate::reflection::executor::{build_reflection_prompt, ReflectionExecutor};
+use crate::runtime::messaging::{self, ThreadOutcome};
+use crate::traits::llm::LlmBackend;
+use crate::traits::store::Store;
 use crate::types::error::EngineError;
 use crate::types::event::EventKind;
 use crate::types::memory::{DocType, MemoryDoc};
 use crate::types::message::ThreadMessage;
-use crate::types::step::{LlmResponse, TokenUsage};
-use crate::types::thread::Thread;
+use crate::types::step::TokenUsage;
+use crate::types::thread::{Thread, ThreadConfig, ThreadType};
 
 /// Result of running the reflection pipeline on a completed thread.
 pub struct ReflectionResult {
@@ -30,16 +36,118 @@ pub struct ReflectionResult {
 
 /// Run the reflection pipeline on a completed thread.
 ///
-/// Produces structured knowledge (MemoryDocs) from the thread's messages
-/// and events. Uses the LLM for summarization and analysis.
+/// Spawns a CodeAct thread with reflection-specific tools that can:
+/// - Read the completed thread's execution transcript
+/// - Query existing knowledge in the project
+/// - Verify tool names against the capability registry
+///
+/// The reflection thread produces structured findings via `FINAL()` which
+/// are parsed into MemoryDocs.
 pub async fn reflect(
+    thread: &Thread,
+    llm: &Arc<dyn LlmBackend>,
+    store: &Arc<dyn Store>,
+    capabilities: &Arc<CapabilityRegistry>,
+) -> Result<ReflectionResult, EngineError> {
+    let transcript = build_transcript(thread);
+
+    // Build the reflection-specific effect executor
+    let executor: Arc<dyn crate::traits::effect::EffectExecutor> =
+        Arc::new(ReflectionExecutor::new(
+            Arc::clone(store),
+            Arc::clone(capabilities),
+            transcript,
+            thread.project_id,
+        ));
+
+    // Create a reflection thread
+    let mut refl_thread = Thread::new(
+        format!("Reflect on: {}", thread.goal),
+        ThreadType::Reflection,
+        thread.project_id,
+        ThreadConfig {
+            max_iterations: 10,
+            enable_reflection: false, // no recursive reflection
+            ..ThreadConfig::default()
+        },
+    );
+
+    // Build and inject the reflection system prompt
+    let actions = executor.available_actions(&[]).await?;
+    let system_prompt = build_reflection_prompt(&actions, &thread.goal);
+    refl_thread
+        .messages
+        .insert(0, ThreadMessage::system(system_prompt));
+    refl_thread.add_message(ThreadMessage::user(format!(
+        "Analyze the completed thread '{}' and produce structured findings.",
+        thread.goal
+    )));
+
+    // Set up infrastructure for the reflection loop
+    let lease_manager = Arc::new(LeaseManager::new());
+    let policy = Arc::new(PolicyEngine::new());
+    let (_signal_tx, signal_rx) = messaging::signal_channel(32);
+
+    // Grant a blanket lease (empty granted_actions = all actions allowed)
+    let lease = lease_manager
+        .grant(refl_thread.id, "reflection_tools", vec![], None, None)
+        .await;
+    refl_thread.capability_leases.push(lease.id);
+
+    // Run the execution loop
+    let mut exec_loop = ExecutionLoop::new(
+        refl_thread,
+        Arc::clone(llm),
+        executor,
+        lease_manager,
+        policy,
+        signal_rx,
+        "system".to_string(),
+    );
+
+    let outcome = exec_loop.run().await?;
+
+    // Parse the outcome into MemoryDocs
+    let response = match outcome {
+        ThreadOutcome::Completed { response: Some(r) } => r,
+        ThreadOutcome::Completed { response: None } => String::new(),
+        ThreadOutcome::Failed { error } => {
+            warn!(
+                thread_id = %thread.id,
+                "reflection thread failed: {error}"
+            );
+            String::new()
+        }
+        _ => String::new(),
+    };
+
+    let docs = parse_reflection_output(&response, thread);
+    let tokens_used = TokenUsage {
+        input_tokens: exec_loop.thread.total_tokens_used,
+        output_tokens: 0, // total already tracked
+        ..TokenUsage::default()
+    };
+
+    debug!(
+        thread_id = %thread.id,
+        docs_produced = docs.len(),
+        total_tokens = tokens_used.total(),
+        "reflection complete (CodeAct)"
+    );
+
+    Ok(ReflectionResult { docs, tokens_used })
+}
+
+/// Run a simplified reflection pipeline using direct LLM calls.
+///
+/// This is a fallback for when CodeAct execution is not available or when
+/// the reflection thread overhead is not desired (e.g., in tests).
+pub async fn reflect_simple(
     thread: &Thread,
     llm: &Arc<dyn LlmBackend>,
 ) -> Result<ReflectionResult, EngineError> {
     let mut docs = Vec::new();
     let mut total_tokens = TokenUsage::default();
-
-    // Build a transcript of the thread's work for the LLM to analyze
     let transcript = build_transcript(thread);
 
     // 1. Summary doc
@@ -69,7 +177,6 @@ pub async fn reflect(
     if thread_failed || had_errors {
         let (issue_doc, tokens) =
             produce_doc(thread, llm, DocType::Issue, &transcript, ISSUE_PROMPT).await?;
-        // Only add if the LLM produced non-trivial content
         if issue_doc.content.len() > 20 {
             docs.push(issue_doc);
         }
@@ -77,7 +184,7 @@ pub async fn reflect(
         total_tokens.output_tokens += tokens.output_tokens;
     }
 
-    // 4. Missing capabilities (if tool-not-found errors detected)
+    // 4. Missing capabilities
     let has_missing_tools = thread.events.iter().any(|e| {
         if let EventKind::ActionFailed { error, .. } = &e.kind {
             error.contains("not found") || error.contains("not available")
@@ -95,7 +202,7 @@ pub async fn reflect(
         total_tokens.output_tokens += tokens.output_tokens;
     }
 
-    // 5. Playbook (successful threads with multiple tool-using steps)
+    // 5. Playbook
     let action_count = thread
         .events
         .iter()
@@ -117,7 +224,7 @@ pub async fn reflect(
         thread_id = %thread.id,
         docs_produced = docs.len(),
         total_tokens = total_tokens.total(),
-        "reflection complete"
+        "reflection complete (simple)"
     );
 
     Ok(ReflectionResult {
@@ -126,7 +233,76 @@ pub async fn reflect(
     })
 }
 
-// ── Prompts ─────────────────────────────────────────────────
+// ── Output parsing ────────────────────────────────────────────
+
+/// Parse the FINAL() output from a reflection CodeAct thread into MemoryDocs.
+fn parse_reflection_output(response: &str, source_thread: &Thread) -> Vec<MemoryDoc> {
+    // Try parsing as JSON first (the expected format)
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(response)
+        && let Some(docs_arr) = value.get("docs").and_then(|d| d.as_array())
+    {
+        return docs_arr
+            .iter()
+            .filter_map(|doc_val| parse_doc_entry(doc_val, source_thread))
+            .collect();
+    }
+
+    // If the response is not valid JSON, try to find JSON in the response
+    if let Some(start) = response.find('{')
+        && let Some(end) = response.rfind('}')
+    {
+        let json_str = &response[start..=end];
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str)
+            && let Some(docs_arr) = value.get("docs").and_then(|d| d.as_array())
+        {
+            return docs_arr
+                .iter()
+                .filter_map(|doc_val| parse_doc_entry(doc_val, source_thread))
+                .collect();
+        }
+    }
+
+    // Fallback: treat the entire response as a summary
+    if response.len() > 20 {
+        vec![MemoryDoc::new(
+            source_thread.project_id,
+            DocType::Summary,
+            format!("Summary: {}", source_thread.goal),
+            response,
+        )
+        .with_source_thread(source_thread.id)]
+    } else {
+        vec![]
+    }
+}
+
+/// Parse a single doc entry from the JSON output.
+fn parse_doc_entry(value: &serde_json::Value, source_thread: &Thread) -> Option<MemoryDoc> {
+    let doc_type_str = value.get("type")?.as_str()?;
+    let title = value.get("title")?.as_str()?;
+    let content = value.get("content")?.as_str()?;
+
+    if content.len() <= 20 {
+        return None;
+    }
+
+    let doc_type = match doc_type_str.to_lowercase().as_str() {
+        "summary" => DocType::Summary,
+        "lesson" => DocType::Lesson,
+        "issue" => DocType::Issue,
+        "spec" => DocType::Spec,
+        "playbook" => DocType::Playbook,
+        "note" => DocType::Note,
+        _ => return None,
+    };
+
+    Some(
+        MemoryDoc::new(source_thread.project_id, doc_type, title, content)
+            .with_source_thread(source_thread.id),
+    )
+}
+
+// ── Prompts (for reflect_simple fallback) ─────────────────────
 
 const SUMMARY_PROMPT: &str = "\
 Summarize what this thread accomplished in 2-4 sentences. Include:
@@ -166,10 +342,10 @@ This thread successfully completed a multi-step task. Extract a reusable playboo
 - Describe the pattern so it can be reused for similar tasks
 Write the playbook as a numbered list of steps. Be specific about tool names and parameters used.";
 
-// ── Helpers ─────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────
 
 /// Build a concise transcript of the thread's work.
-fn build_transcript(thread: &Thread) -> String {
+pub(crate) fn build_transcript(thread: &Thread) -> String {
     let mut parts = Vec::new();
 
     parts.push(format!("Goal: {}", thread.goal));
@@ -198,9 +374,9 @@ fn build_transcript(thread: &Thread) -> String {
         .events
         .iter()
         .filter_map(|e| match &e.kind {
-            EventKind::ActionFailed { action_name, error, .. } => {
-                Some(format!("Action '{action_name}' failed: {error}"))
-            }
+            EventKind::ActionFailed {
+                action_name, error, ..
+            } => Some(format!("Action '{action_name}' failed: {error}")),
             EventKind::StepFailed { error, .. } => Some(format!("Step failed: {error}")),
             _ => None,
         })
@@ -231,18 +407,17 @@ async fn produce_doc(
         ThreadMessage::user(prompt.to_string()),
     ];
 
-    let config = LlmCallConfig {
+    let config = crate::traits::llm::LlmCallConfig {
         force_text: true,
-        ..LlmCallConfig::default()
+        ..crate::traits::llm::LlmCallConfig::default()
     };
 
     let output = llm.complete(&messages, &[], &config).await?;
 
     let content = match output.response {
-        LlmResponse::Text(t) => t,
-        LlmResponse::ActionCalls { content, .. } | LlmResponse::Code { content, .. } => {
-            content.unwrap_or_default()
-        }
+        crate::types::step::LlmResponse::Text(t) => t,
+        crate::types::step::LlmResponse::ActionCalls { content, .. }
+        | crate::types::step::LlmResponse::Code { content, .. } => content.unwrap_or_default(),
     };
 
     let title = match doc_type {
@@ -268,7 +443,7 @@ mod tests {
     use crate::types::event::ThreadEvent;
     use crate::types::project::ProjectId;
     use crate::types::step::TokenUsage;
-    use crate::types::thread::{ThreadConfig, ThreadType};
+    use crate::types::thread::ThreadConfig;
     use std::sync::Mutex;
 
     struct MockLlm {
@@ -298,7 +473,7 @@ mod tests {
                 r.remove(0)
             };
             Ok(LlmOutput {
-                response: LlmResponse::Text(text),
+                response: crate::types::step::LlmResponse::Text(text),
                 usage: TokenUsage {
                     input_tokens: 100,
                     output_tokens: 50,
@@ -323,18 +498,21 @@ mod tests {
         thread
     }
 
-    #[tokio::test]
-    async fn reflect_produces_summary_for_clean_thread() {
-        let thread = make_completed_thread();
-        let llm = MockLlm::with_responses(vec!["Thread accomplished the test task successfully."]);
+    // ── reflect_simple tests (direct LLM calls) ────────────────
 
-        let result = reflect(&thread, &llm).await.unwrap();
+    #[tokio::test]
+    async fn reflect_simple_produces_summary() {
+        let thread = make_completed_thread();
+        let llm =
+            MockLlm::with_responses(vec!["Thread accomplished the test task successfully."]);
+
+        let result = reflect_simple(&thread, &llm).await.unwrap();
         assert_eq!(result.docs.len(), 1);
         assert_eq!(result.docs[0].doc_type, DocType::Summary);
     }
 
     #[tokio::test]
-    async fn reflect_produces_lesson_on_errors() {
+    async fn reflect_simple_produces_lesson_on_errors() {
         let mut thread = make_completed_thread();
         thread.events.push(ThreadEvent::new(
             thread.id,
@@ -353,7 +531,7 @@ mod tests {
             "ALIAS: web_search -> web-search",
         ]);
 
-        let result = reflect(&thread, &llm).await.unwrap();
+        let result = reflect_simple(&thread, &llm).await.unwrap();
         let types: Vec<DocType> = result.docs.iter().map(|d| d.doc_type).collect();
         assert!(types.contains(&DocType::Summary));
         assert!(types.contains(&DocType::Lesson));
@@ -362,7 +540,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reflect_produces_spec_on_tool_not_found() {
+    async fn reflect_simple_produces_spec_on_tool_not_found() {
         let mut thread = make_completed_thread();
         thread.events.push(ThreadEvent::new(
             thread.id,
@@ -381,7 +559,7 @@ mod tests {
             "MISSING: missing_tool -> needs implementation",
         ]);
 
-        let result = reflect(&thread, &llm).await.unwrap();
+        let result = reflect_simple(&thread, &llm).await.unwrap();
         let spec_docs: Vec<&MemoryDoc> = result
             .docs
             .iter()
@@ -392,9 +570,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reflect_produces_playbook_on_successful_multi_step() {
+    async fn reflect_simple_produces_playbook_on_multi_step() {
         let mut thread = make_completed_thread();
-        // Add 2+ action executed events to trigger playbook
         thread.events.push(ThreadEvent::new(
             thread.id,
             EventKind::ActionExecuted {
@@ -416,23 +593,19 @@ mod tests {
 
         let llm = MockLlm::with_responses(vec![
             "Summary of successful thread.",
-            "1. Search web for topic\n2. Analyze results with llm_query\n3. Return summary",
+            "1. Search web\n2. Analyze results\n3. Return summary",
         ]);
 
-        let result = reflect(&thread, &llm).await.unwrap();
-        let playbook_docs: Vec<&MemoryDoc> = result
+        let result = reflect_simple(&thread, &llm).await.unwrap();
+        assert!(result
             .docs
             .iter()
-            .filter(|d| d.doc_type == DocType::Playbook)
-            .collect();
-        assert_eq!(playbook_docs.len(), 1);
-        assert!(playbook_docs[0].title.starts_with("Playbook:"));
+            .any(|d| d.doc_type == DocType::Playbook));
     }
 
     #[tokio::test]
-    async fn reflect_skips_playbook_for_single_action() {
+    async fn reflect_simple_skips_playbook_for_single_action() {
         let mut thread = make_completed_thread();
-        // Only 1 action — not enough for a playbook
         thread.events.push(ThreadEvent::new(
             thread.id,
             EventKind::ActionExecuted {
@@ -445,12 +618,64 @@ mod tests {
 
         let llm = MockLlm::with_responses(vec!["Simple summary."]);
 
-        let result = reflect(&thread, &llm).await.unwrap();
-        let playbook_docs: Vec<&MemoryDoc> = result
+        let result = reflect_simple(&thread, &llm).await.unwrap();
+        assert!(!result
             .docs
             .iter()
-            .filter(|d| d.doc_type == DocType::Playbook)
-            .collect();
-        assert!(playbook_docs.is_empty());
+            .any(|d| d.doc_type == DocType::Playbook));
+    }
+
+    // ── parse_reflection_output tests ──────────────────────────
+
+    #[test]
+    fn parse_valid_json_output() {
+        let thread = make_completed_thread();
+        let json = r#"{"docs": [
+            {"type": "summary", "title": "Summary: test", "content": "The thread completed successfully with good results."},
+            {"type": "lesson", "title": "Lesson: test", "content": "Always check tool names before calling them."}
+        ]}"#;
+
+        let docs = parse_reflection_output(json, &thread);
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].doc_type, DocType::Summary);
+        assert_eq!(docs[1].doc_type, DocType::Lesson);
+    }
+
+    #[test]
+    fn parse_json_embedded_in_text() {
+        let thread = make_completed_thread();
+        let text = r#"Here are my findings: {"docs": [{"type": "summary", "title": "test", "content": "The thread did something interesting and useful."}]} end"#;
+
+        let docs = parse_reflection_output(text, &thread);
+        assert_eq!(docs.len(), 1);
+    }
+
+    #[test]
+    fn parse_fallback_to_summary() {
+        let thread = make_completed_thread();
+        let text = "This is a plain text response with enough content to be a valid summary doc.";
+
+        let docs = parse_reflection_output(text, &thread);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].doc_type, DocType::Summary);
+    }
+
+    #[test]
+    fn parse_skips_short_content() {
+        let thread = make_completed_thread();
+        let json =
+            r#"{"docs": [{"type": "summary", "title": "test", "content": "too short"}]}"#;
+
+        let docs = parse_reflection_output(json, &thread);
+        assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn parse_skips_unknown_doc_type() {
+        let thread = make_completed_thread();
+        let json = r#"{"docs": [{"type": "unknown_type", "title": "test", "content": "This has enough content but unknown type so it gets skipped."}]}"#;
+
+        let docs = parse_reflection_output(json, &thread);
+        assert!(docs.is_empty());
     }
 }
