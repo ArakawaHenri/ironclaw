@@ -347,10 +347,12 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
 
         // Apply per-user model override from settings (first iteration only
         // to avoid repeated DB lookups within the same agentic loop).
+        // Uses "selected_model" — the same key the /model command persists to
+        // via SettingsStore (per-user scoped).
         if iteration == 0
             && let Some(store) = self.agent.store()
             && let Ok(Some(value)) = store
-                .get_setting(&self.message.user_id, "preferred_model")
+                .get_setting(&self.message.user_id, "selected_model")
                 .await
             && let Some(model) = value.as_str()
         {
