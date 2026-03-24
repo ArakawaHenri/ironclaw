@@ -41,16 +41,19 @@ pub struct CustomLlmProviderSettings {
 /// Stored as `llm_builtin_overrides` in the settings store, keyed by provider ID
 /// (e.g. `"openai"`, `"gemini"`). Resolved at startup during `LlmConfig::resolve()`.
 ///
-/// Note: Environment variables and the global `selected_model` (if set) take
-/// precedence over these per-provider overrides.
+/// Note: The global `selected_model` (if set) takes precedence over these
+/// per-provider overrides, which in turn take precedence over environment variables.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LlmBuiltinOverride {
-    /// API key override used when no API key is provided via environment variables.
+    /// API key override. Takes precedence over environment variables.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
-    /// Default model override used when no global `selected_model` is configured.
+    /// Model override. Takes precedence over environment variables but not `selected_model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Base URL override. Takes precedence over environment variables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
 }
 
 /// User settings persisted to disk.
@@ -2326,5 +2329,66 @@ mod tests {
         assert!(current.embeddings.enabled);
         assert_eq!(current.embeddings.provider, "nearai");
         assert_eq!(current.embeddings.model, "text-embedding-3-large");
+    }
+
+    /// DB values must win over TOML values when both set the same field.
+    ///
+    /// This mirrors the merge order in `Config::from_db_with_toml`:
+    /// TOML is loaded as the base, then DB is merged on top.
+    #[test]
+    fn db_settings_win_over_toml_settings() {
+        // Simulate TOML base: has llm_backend and selected_model
+        let mut base = Settings {
+            llm_backend: Some("openai".to_string()),
+            selected_model: Some("toml-model".to_string()),
+            ..Default::default()
+        };
+
+        // Simulate DB overlay: has different llm_backend and selected_model
+        let db = Settings {
+            llm_backend: Some("anthropic".to_string()),
+            selected_model: Some("db-model".to_string()),
+            ..Default::default()
+        };
+
+        // Merge DB on top of TOML (same order as from_db_with_toml)
+        base.merge_from(&db);
+
+        assert_eq!(
+            base.llm_backend.as_deref(),
+            Some("anthropic"),
+            "DB llm_backend must win over TOML"
+        );
+        assert_eq!(
+            base.selected_model.as_deref(),
+            Some("db-model"),
+            "DB selected_model must win over TOML"
+        );
+    }
+
+    /// When DB has no value (default), TOML value should be preserved.
+    #[test]
+    fn toml_settings_used_when_db_has_no_value() {
+        let mut base = Settings {
+            llm_backend: Some("openai".to_string()),
+            selected_model: Some("toml-model".to_string()),
+            ..Default::default()
+        };
+
+        // DB has no llm_backend or selected_model (both default/None)
+        let db = Settings::default();
+
+        base.merge_from(&db);
+
+        assert_eq!(
+            base.llm_backend.as_deref(),
+            Some("openai"),
+            "TOML llm_backend should be preserved when DB has no value"
+        );
+        assert_eq!(
+            base.selected_model.as_deref(),
+            Some("toml-model"),
+            "TOML selected_model should be preserved when DB has no value"
+        );
     }
 }

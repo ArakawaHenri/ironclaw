@@ -2549,6 +2549,37 @@ async fn test_provider_connection(req: TestConnectionRequest) -> TestConnectionR
     let base = req.base_url.trim_end_matches('/');
 
     match req.adapter.as_str() {
+        "nearai" if base.contains("private") => {
+            // NEAR AI private endpoints use /health for connectivity checks.
+            let url = format!("{base}/health");
+            let mut builder = client.get(&url);
+            if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
+                builder = builder.header("Authorization", format!("Bearer {key}"));
+            }
+            match builder.send().await {
+                Ok(r) if r.status().is_success() => TestConnectionResponse {
+                    ok: true,
+                    message: format!("Connected ({})", r.status()),
+                },
+                Ok(r)
+                    if r.status() == reqwest::StatusCode::UNAUTHORIZED
+                        || r.status() == reqwest::StatusCode::FORBIDDEN =>
+                {
+                    TestConnectionResponse {
+                        ok: false,
+                        message: format!("Authentication failed ({})", r.status()),
+                    }
+                }
+                Ok(r) => TestConnectionResponse {
+                    ok: false,
+                    message: format!("Server returned {}", r.status()),
+                },
+                Err(e) => TestConnectionResponse {
+                    ok: false,
+                    message: format!("Connection failed: {e}"),
+                },
+            }
+        }
         "ollama" => {
             let url = format!("{base}/api/tags");
             match client.get(&url).send().await {
@@ -2625,9 +2656,10 @@ fn interpret_chat_response(
                     message: format!("Authentication failed ({})", status),
                 }
             } else if status == reqwest::StatusCode::BAD_REQUEST
+                || status == reqwest::StatusCode::NOT_FOUND
                 || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
             {
-                // 400/422 = server reachable, likely wrong model name — still a success for connectivity
+                // 400/404/422 = server reachable, likely wrong model name or endpoint variant — still a success for connectivity
                 TestConnectionResponse {
                     ok: true,
                     message: format!("Server reachable ({})", status),
@@ -2737,13 +2769,15 @@ async fn fetch_provider_models(req: ListModelsRequest) -> ListModelsResponse {
             }
         }
         _ => {
-            // OpenAI-compatible and Anthropic both support GET /models
-            let effective_base =
-                if req.adapter == "anthropic" && !base.ends_with("/v1") && !base.contains("/v1/") {
-                    format!("{base}/v1")
-                } else {
-                    base.to_string()
-                };
+            // OpenAI-compatible, Anthropic, and NEAR AI all support GET /models.
+            // NEAR AI private endpoints and Anthropic need a /v1 prefix.
+            let effective_base = if (req.adapter == "nearai" && base.contains("private"))
+                || (req.adapter == "anthropic" && !base.ends_with("/v1") && !base.contains("/v1/"))
+            {
+                format!("{base}/v1")
+            } else {
+                base.to_string()
+            };
             let url = format!("{effective_base}/models");
             let mut builder = client.get(&url);
             if req.adapter == "anthropic" {
@@ -2804,27 +2838,25 @@ async fn fetch_provider_models(req: ListModelsRequest) -> ListModelsResponse {
 /// The frontend uses these as fallback values when the DB has no overrides.
 /// API keys are never returned — only a boolean `has_api_key`.
 async fn llm_env_defaults_handler() -> Json<serde_json::Value> {
+    use crate::config::helpers::optional_env;
     use crate::llm::registry::ProviderRegistry;
 
     let registry = ProviderRegistry::load();
     let mut defaults = serde_json::Map::new();
 
+    // Helper: read env var via optional_env (checks real env + injected overlay).
+    let read_env = |key: &str| -> Option<String> { optional_env(key).ok().flatten() };
+
     // NEAR AI is a special case (not in the registry)
     {
         let mut entry = serde_json::Map::new();
-        if let Ok(key) = std::env::var("NEARAI_API_KEY")
-            && !key.is_empty()
-        {
+        if let Some(key) = read_env("NEARAI_API_KEY") {
             entry.insert("api_key".to_string(), serde_json::Value::String(key));
         }
-        if let Ok(model) = std::env::var("NEARAI_MODEL")
-            && !model.is_empty()
-        {
+        if let Some(model) = read_env("NEARAI_MODEL") {
             entry.insert("model".to_string(), serde_json::Value::String(model));
         }
-        if let Ok(url) = std::env::var("NEARAI_BASE_URL")
-            && !url.is_empty()
-        {
+        if let Some(url) = read_env("NEARAI_BASE_URL") {
             entry.insert("base_url".to_string(), serde_json::Value::String(url));
         }
         defaults.insert("nearai".to_string(), serde_json::Value::Object(entry));
@@ -2835,21 +2867,17 @@ async fn llm_env_defaults_handler() -> Json<serde_json::Value> {
         let mut entry = serde_json::Map::new();
 
         if let Some(ref api_key_env) = def.api_key_env
-            && let Ok(key) = std::env::var(api_key_env)
-            && !key.is_empty()
+            && let Some(key) = read_env(api_key_env)
         {
             entry.insert("api_key".to_string(), serde_json::Value::String(key));
         }
 
-        if let Ok(model) = std::env::var(&def.model_env)
-            && !model.is_empty()
-        {
+        if let Some(model) = read_env(&def.model_env) {
             entry.insert("model".to_string(), serde_json::Value::String(model));
         }
 
         if let Some(ref base_url_env) = def.base_url_env
-            && let Ok(url) = std::env::var(base_url_env)
-            && !url.is_empty()
+            && let Some(url) = read_env(base_url_env)
         {
             entry.insert("base_url".to_string(), serde_json::Value::String(url));
         }

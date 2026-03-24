@@ -6318,7 +6318,8 @@ function renderProviders() {
       ? '<button class="provider-action-btn" data-action="set-active-provider" data-id="' + escapeHtml(p.id) + '">' + I18n.t('config.useProvider') + '</button>'
       : '';
     const envDef = _envDefaults[p.id] || {};
-    const effectiveBaseUrl = envDef.base_url || p.base_url;
+    const overrideBaseUrl = p.builtin && _builtinOverrides[p.id] ? (_builtinOverrides[p.id].base_url || '') : '';
+    const effectiveBaseUrl = overrideBaseUrl || envDef.base_url || p.base_url;
     const baseUrlText = effectiveBaseUrl
       ? '<span class="provider-url">' + escapeHtml(effectiveBaseUrl) + '</span>'
       : '';
@@ -6421,25 +6422,22 @@ function configureBuiltinProvider(id) {
   const titleEl = document.getElementById('provider-form-title');
   titleEl.textContent = I18n.t('config.configureProvider') + ': ' + (p.name || id);
   titleEl.removeAttribute('data-i18n');
-  // Hide name/id/adapter rows; show base-url as read-only for reference
+  // Hide name/id/adapter rows; show base-url as editable
   document.getElementById('provider-name-row').style.display = 'none';
   document.getElementById('provider-id-row').style.display = 'none';
   document.getElementById('provider-adapter-row').style.display = 'none';
   const baseUrlInput = document.getElementById('provider-base-url');
-  const envBaseUrl = (_envDefaults[id] || {}).base_url;
-  const effectiveBaseUrl = envBaseUrl || p.base_url;
-  if (effectiveBaseUrl) {
-    document.getElementById('provider-base-url-row').style.display = '';
-    baseUrlInput.value = effectiveBaseUrl;
-    baseUrlInput.readOnly = true;
-    baseUrlInput.style.opacity = '0.6';
-  } else {
-    document.getElementById('provider-base-url-row').style.display = 'none';
-  }
-  document.getElementById('provider-api-key-row').style.display = p.api_key_required !== false ? '' : 'none';
-  document.getElementById('fetch-models-btn').style.display = p.can_list_models ? '' : 'none';
   const override = _builtinOverrides[id] || {};
   const envDef = _envDefaults[id] || {};
+  // Priority: db override > env > hardcoded default
+  const effectiveBaseUrl = override.base_url || envDef.base_url || p.base_url;
+  document.getElementById('provider-base-url-row').style.display = '';
+  baseUrlInput.value = effectiveBaseUrl || '';
+  baseUrlInput.readOnly = false;
+  baseUrlInput.style.opacity = '';
+  baseUrlInput.placeholder = p.base_url || '';
+  document.getElementById('provider-api-key-row').style.display = p.api_key_required !== false ? '' : 'none';
+  document.getElementById('fetch-models-btn').style.display = p.can_list_models ? '' : 'none';
   const apiKeyInput = document.getElementById('provider-api-key');
   apiKeyInput.value = override.api_key || envDef.api_key || '';
   apiKeyInput.placeholder = '';
@@ -6487,12 +6485,13 @@ document.getElementById('test-provider-btn').addEventListener('click', () => {
   const apiKey = document.getElementById('provider-api-key').value.trim();
   const model = document.getElementById('provider-model').value.trim();
 
-  // For built-in providers, use the hardcoded adapter/base_url from BUILTIN_PROVIDERS
+  // For built-in providers, use the hardcoded adapter from BUILTIN_PROVIDERS.
+  // base_url comes from the form which already reflects: env > hardcoded default.
   if (_configuringBuiltinId) {
     const p = BUILTIN_PROVIDERS.find((x) => x.id === _configuringBuiltinId);
     if (p) {
       adapter = p.adapter;
-      baseUrl = p.base_url;
+      if (!baseUrl) baseUrl = p.base_url;
     }
   }
 
@@ -6529,10 +6528,12 @@ document.getElementById('save-provider-btn').addEventListener('click', () => {
   if (_configuringBuiltinId) {
     const apiKey = document.getElementById('provider-api-key').value.trim();
     const model = document.getElementById('provider-model').value.trim();
+    const baseUrl = document.getElementById('provider-base-url').value.trim();
     const id = _configuringBuiltinId;
     const override = {};
     if (apiKey) override.api_key = apiKey;
     if (model) override.model = model;
+    if (baseUrl) override.base_url = baseUrl;
     const prev = _builtinOverrides[id];
     _builtinOverrides[id] = override;
     const isActive = id === _activeLlmBackend;
@@ -6664,12 +6665,13 @@ document.getElementById('fetch-models-btn').addEventListener('click', () => {
   let baseUrl = document.getElementById('provider-base-url').value.trim();
   const apiKey = document.getElementById('provider-api-key').value.trim();
 
-  // For built-in providers, use the hardcoded base_url and adapter from BUILTIN_PROVIDERS
+  // For built-in providers, use the hardcoded adapter from BUILTIN_PROVIDERS.
+  // base_url comes from the form which already reflects: env > hardcoded default.
   if (_configuringBuiltinId) {
     const p = BUILTIN_PROVIDERS.find((x) => x.id === _configuringBuiltinId);
     if (p) {
       adapter = p.adapter;
-      baseUrl = p.base_url;
+      if (!baseUrl) baseUrl = p.base_url;
     }
   }
 

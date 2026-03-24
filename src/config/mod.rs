@@ -1,6 +1,6 @@
 //! Configuration for IronClaw.
 //!
-//! Settings are loaded with priority: env var > database > default.
+//! Settings are loaded with priority: database > env var > default.
 //! `DATABASE_URL` lives in `~/.ironclaw/.env` (loaded via dotenvy early
 //! in startup). Everything else comes from env vars, the DB settings
 //! table, or auto-detection.
@@ -188,7 +188,7 @@ impl Config {
 
     /// Load configuration from environment variables and the database.
     ///
-    /// Priority: env var > TOML config file > DB settings > default.
+    /// Priority: DB settings > env var > TOML config file > default.
     /// This is the primary way to load config after DB is connected.
     pub async fn from_db(
         store: &(dyn crate::db::SettingsStore + Sync),
@@ -198,6 +198,10 @@ impl Config {
     }
 
     /// Load from DB with an optional TOML config file overlay.
+    ///
+    /// Priority: DB settings > env var > TOML config file > default.
+    /// TOML is loaded first as a base, then DB values are merged on top
+    /// so that DB always wins over TOML.
     pub async fn from_db_with_toml(
         store: &(dyn crate::db::SettingsStore + Sync),
         user_id: &str,
@@ -206,19 +210,22 @@ impl Config {
         let _ = dotenvy::dotenv();
         crate::bootstrap::load_ironclaw_env();
 
-        // Load all settings from DB into a Settings struct
-        let mut db_settings = match store.get_all_settings(user_id).await {
-            Ok(map) => Settings::from_db_map(&map),
+        // Start with TOML config as a base (lowest priority among the two).
+        let mut settings = Settings::default();
+        Self::apply_toml_overlay(&mut settings, toml_path)?;
+
+        // Overlay DB settings on top so DB values win over TOML.
+        match store.get_all_settings(user_id).await {
+            Ok(map) => {
+                let db_settings = Settings::from_db_map(&map);
+                settings.merge_from(&db_settings);
+            }
             Err(e) => {
                 tracing::warn!("Failed to load settings from DB, using defaults: {}", e);
-                Settings::default()
             }
         };
 
-        // Overlay TOML config file (values win over DB settings)
-        Self::apply_toml_overlay(&mut db_settings, toml_path)?;
-
-        Self::build(&db_settings).await
+        Self::build(&settings).await
     }
 
     /// Load configuration from environment variables only (no database).
@@ -294,11 +301,13 @@ impl Config {
         toml_path: Option<&std::path::Path>,
     ) -> Result<(), ConfigError> {
         let settings = if let Some(store) = store {
-            let mut s = match store.get_all_settings(user_id).await {
-                Ok(map) => Settings::from_db_map(&map),
-                Err(_) => Settings::default(),
-            };
+            // TOML as base, then DB on top (DB wins).
+            let mut s = Settings::default();
             Self::apply_toml_overlay(&mut s, toml_path)?;
+            if let Ok(map) = store.get_all_settings(user_id).await {
+                let db_settings = Settings::from_db_map(&map);
+                s.merge_from(&db_settings);
+            }
             s
         } else {
             Settings::default()
