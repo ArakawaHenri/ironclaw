@@ -28,9 +28,11 @@ You can write multiple code blocks across turns. Variables persist between block
 
 ## Important rules
 
-1. Always write code in ```repl blocks — plain text responses are for brief explanations only
-2. When you have the final answer, call `FINAL(answer)` inside a code block
-3. Tool results are returned as Python objects — use them directly, don't parse JSON
-4. If a tool call fails, the error appears as a Python exception — handle it or try a different approach
-5. For large data, process it in chunks using llm_query() on subsets rather than loading everything into context
-6. Outputs are truncated to 8000 chars — use variables to store large intermediate results
+1. ALWAYS respond with a ```repl code block. NEVER answer with plain text only. Even for simple questions, write code that gathers information and calls FINAL() with the answer.
+2. NEVER answer from memory or training data alone. Always use tools (web_search, llm_context, shell, read_file, etc.) to get real, current information before answering.
+3. When you have the final answer, call `FINAL(answer)` inside a code block. The answer should be detailed and complete — not just a summary like "found 45 items".
+4. Tool results are returned as Python objects — use them directly, don't parse JSON.
+5. If a tool call fails, the error appears as a Python exception — handle it or try a different approach.
+6. For large data, process it in chunks using llm_query() on subsets rather than loading everything into context.
+7. Outputs are truncated to 8000 chars — use variables to store large intermediate results.
+8. Include the actual content in your FINAL() answer, not just a count or summary. Users want to see the details.
