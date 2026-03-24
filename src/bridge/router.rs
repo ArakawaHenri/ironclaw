@@ -10,11 +10,15 @@ use ironclaw_engine::{
     Store, ThreadConfig, ThreadManager, ThreadOutcome,
 };
 
+use ironclaw_common::AppEvent;
+
 use crate::agent::Agent;
 use crate::bridge::effect_adapter::EffectBridgeAdapter;
 use crate::bridge::llm_adapter::LlmBridgeAdapter;
 use crate::bridge::store_adapter::HybridStore;
+use crate::channels::web::sse::SseManager;
 use crate::channels::{IncomingMessage, StatusUpdate};
+use crate::db::Database;
 use crate::error::Error;
 
 /// Check if the engine v2 is enabled via `ENGINE_V2=true` environment variable.
@@ -41,6 +45,10 @@ struct EngineState {
     default_project_id: ironclaw_engine::ProjectId,
     /// Currently pending approval (if any).
     pending_approval: RwLock<Option<PendingApproval>>,
+    /// SSE manager for broadcasting AppEvents to the web gateway.
+    sse: Option<Arc<SseManager>>,
+    /// V1 database for writing conversation messages (gateway reads from here).
+    db: Option<Arc<dyn Database>>,
 }
 
 /// Global engine state, initialized on first use.
@@ -132,6 +140,8 @@ async fn get_or_init_engine(agent: &Agent) -> Result<(), Error> {
         store: store.clone(),
         default_project_id: project_id,
         pending_approval: RwLock::new(None),
+        sse: agent.deps.sse_tx.clone(),
+        db: agent.deps.store.clone(),
     });
 
     Ok(())
@@ -272,14 +282,21 @@ pub async fn handle_with_engine(
     let channels = &agent.channels;
     let channel_name = &message.channel;
     let metadata = &message.metadata;
+    let sse = state.sse.as_ref();
+    let tid_str = thread_id.to_string();
 
-    // Forward events to the channel while waiting for thread completion
+    // Forward events to both the channel (REPL) and SSE (web gateway)
     loop {
         tokio::select! {
             event = event_rx.recv() => {
                 match event {
                     Ok(ref evt) if evt.thread_id == thread_id => {
                         forward_event_to_channel(evt, channels, channel_name, metadata).await;
+                        if let Some(sse) = sse
+                            && let Some(app_event) = thread_event_to_app_event(evt, &tid_str)
+                        {
+                            sse.broadcast(app_event);
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     _ => {}
@@ -313,6 +330,42 @@ pub async fn handle_with_engine(
 
     // Note: trace recording, retrospective analysis, and LLM reflection
     // all run automatically inside ThreadManager after the thread completes.
+
+    // Persist to v1 conversation DB so web gateway can display messages
+    if let Some(ref db) = state.db {
+        // get_or_create_assistant_conversation gives us a per-user, per-channel conversation
+        if let Ok(conv_id_v1) = db
+            .get_or_create_assistant_conversation(&message.user_id, &message.channel)
+            .await
+        {
+            // Write user message
+            let _ = db
+                .add_conversation_message(conv_id_v1, "user", content)
+                .await;
+
+            // Write agent response
+            if let ThreadOutcome::Completed {
+                response: Some(ref text),
+            } = outcome
+            {
+                let _ = db
+                    .add_conversation_message(conv_id_v1, "assistant", text)
+                    .await;
+            }
+        }
+    }
+
+    // Broadcast final response as AppEvent for web gateway SSE
+    if let Some(ref sse) = state.sse
+        && let ThreadOutcome::Completed {
+            response: Some(ref text),
+        } = outcome
+    {
+        sse.broadcast(AppEvent::Response {
+            content: text.clone(),
+            thread_id: thread_id.to_string(),
+        });
+    }
 
     // Convert outcome to response
     match outcome {
@@ -422,5 +475,41 @@ async fn forward_event_to_channel(
                 .await;
         }
         _ => {}
+    }
+}
+
+/// Convert a ThreadEvent to an AppEvent for the web gateway SSE stream.
+fn thread_event_to_app_event(
+    event: &ironclaw_engine::ThreadEvent,
+    thread_id: &str,
+) -> Option<AppEvent> {
+    use ironclaw_engine::EventKind;
+
+    match &event.kind {
+        EventKind::StepStarted { .. } => Some(AppEvent::Thinking {
+            message: "Thinking...".into(),
+            thread_id: Some(thread_id.into()),
+        }),
+        EventKind::ActionExecuted { action_name, .. } => Some(AppEvent::ToolCompleted {
+            name: action_name.clone(),
+            success: true,
+            error: None,
+            parameters: None,
+            thread_id: Some(thread_id.into()),
+        }),
+        EventKind::ActionFailed {
+            action_name, error, ..
+        } => Some(AppEvent::ToolCompleted {
+            name: action_name.clone(),
+            success: false,
+            error: Some(error.clone()),
+            parameters: None,
+            thread_id: Some(thread_id.into()),
+        }),
+        EventKind::StepCompleted { .. } => Some(AppEvent::Status {
+            message: "Processing results...".into(),
+            thread_id: Some(thread_id.into()),
+        }),
+        _ => None,
     }
 }

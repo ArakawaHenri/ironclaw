@@ -177,7 +177,7 @@ pub struct AgentDeps {
 /// The main agent that coordinates all components.
 pub struct Agent {
     pub(super) config: AgentConfig,
-    pub(super) deps: AgentDeps,
+    pub(crate) deps: AgentDeps,
     pub(crate) channels: Arc<ChannelManager>,
     pub(super) context_manager: Arc<ContextManager>,
     pub(super) scheduler: Arc<Scheduler>,
