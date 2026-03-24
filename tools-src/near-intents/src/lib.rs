@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 const DEFUSE_TOKENS_URL: &str = "https://1click.chaindefuser.com/v0/tokens";
+const DEFUSE_QUOTE_URL: &str = "https://1click.chaindefuser.com/v0/quote";
 const NEAR_RPC_URL: &str = "https://rpc.mainnet.near.org";
 const MAX_ALIAS_WORDS: usize = 5;
 
@@ -80,6 +81,15 @@ enum Action {
         account_id: String,
         token_ids: Option<Vec<String>>,
     },
+    #[serde(rename = "get_swap_quote")]
+    GetSwapQuote {
+        from_token: String,
+        to_token: String,
+        amount: String,
+        account_id: String,
+        slippage_bps: Option<u32>,
+        swap_type: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -112,6 +122,7 @@ struct TokenMetadata {
     symbol: String,
     blockchain: String,
     contract_address: Option<String>,
+    price: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -121,6 +132,13 @@ struct TokenBalance {
     raw_balance: String,
     balance: f64,
     decimals: u32,
+    value_usdc: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct BalanceResponse {
+    positions: Vec<TokenBalance>,
+    total_value_usdc: f64,
 }
 
 struct NearIntentsTool;
@@ -146,7 +164,8 @@ impl exports::near::agent::tool::Guest for NearIntentsTool {
     fn description() -> String {
         "Near Intents tools for the Defuse protocol on NEAR. Resolves natural-language \
          token references to Defuse asset IDs, reverse-resolves asset IDs to metadata, \
-         and queries multi-token balances. No authentication required."
+         queries multi-token balances with USD values, and gets dry swap quotes. \
+         No authentication required."
             .to_string()
     }
 }
@@ -163,8 +182,66 @@ fn execute_inner(params: &str) -> Result<String, String> {
         Action::GetBalance {
             account_id,
             token_ids,
-        } => get_balance(&account_id, token_ids),
+        } => get_balance(&normalize_account_id(&account_id), token_ids),
+        Action::GetSwapQuote {
+            from_token,
+            to_token,
+            amount,
+            account_id,
+            slippage_bps,
+            swap_type,
+        } => get_swap_quote(
+            &from_token,
+            &to_token,
+            &amount,
+            &normalize_account_id(&account_id),
+            slippage_bps.unwrap_or(100),
+            swap_type.as_deref().unwrap_or("EXACT_INPUT"),
+        ),
     }
+}
+
+/// Recover hex address if the LLM converted it to decimal.
+fn normalize_account_id(account_id: &str) -> String {
+    if account_id.chars().all(|c| c.is_ascii_digit()) && account_id.len() > 40 {
+        return format!("0x{}", decimal_to_hex(account_id));
+    }
+    account_id.to_string()
+}
+
+/// Convert a decimal string to lowercase hex (no prefix).
+fn decimal_to_hex(decimal: &str) -> String {
+    let mut digits: Vec<u8> = decimal
+        .bytes()
+        .map(|b| b - b'0')
+        .collect();
+
+    if digits.is_empty() || (digits.len() == 1 && digits[0] == 0) {
+        return "0".into();
+    }
+
+    let mut hex_chars: Vec<u8> = Vec::new();
+    while !(digits.is_empty() || digits.len() == 1 && digits[0] == 0) {
+        let mut remainder = 0u32;
+        let mut new_digits: Vec<u8> = Vec::new();
+        for &d in &digits {
+            let val = remainder * 10 + d as u32;
+            let quotient = val / 16;
+            remainder = val % 16;
+            if !new_digits.is_empty() || quotient > 0 {
+                new_digits.push(quotient as u8);
+            }
+        }
+        hex_chars.push(if remainder < 10 {
+            b'0' + remainder as u8
+        } else {
+            b'a' + (remainder as u8 - 10)
+        });
+        digits = new_digits;
+    }
+
+    hex_chars.reverse();
+    String::from_utf8(hex_chars).unwrap_or_default()
 }
 
 fn fetch_token_list() -> Result<Vec<TokenMetadata>, String> {
@@ -194,6 +271,7 @@ fn fetch_token_list() -> Result<Vec<TokenMetadata>, String> {
             symbol: t.symbol,
             blockchain: t.blockchain,
             contract_address: t.contract_address,
+            price: t.price,
         })
         .collect();
 
@@ -501,7 +579,9 @@ fn get_balance(account_id: &str, token_ids: Option<Vec<String>>) -> Result<Strin
         ));
     }
 
-    let mut balances: Vec<TokenBalance> = Vec::new();
+    let mut positions: Vec<TokenBalance> = Vec::new();
+    let mut total_value_usdc = 0.0;
+
     for (token_id, raw_balance) in ids.iter().zip(raw_balances.iter()) {
         if raw_balance == "0" {
             continue;
@@ -510,19 +590,241 @@ fn get_balance(account_id: &str, token_ids: Option<Vec<String>>) -> Result<Strin
         let meta = amap.reverse_map.get(token_id);
         let decimals = meta.map(|m| m.decimals).unwrap_or(0);
         let symbol = meta.map(|m| m.symbol.clone());
-
         let balance = parse_balance(raw_balance, decimals);
 
-        balances.push(TokenBalance {
+        let value_usdc = meta.and_then(|m| m.price).map(|price| {
+            let val = balance * price;
+            let rounded = (val * 100.0).round() / 100.0;
+            total_value_usdc += rounded;
+            rounded
+        });
+
+        positions.push(TokenBalance {
             defuse_asset_id: token_id.clone(),
             symbol,
             raw_balance: raw_balance.clone(),
             balance,
             decimals,
+            value_usdc,
         });
     }
 
-    serde_json::to_string(&balances).map_err(|e| format!("Serialization error: {e}"))
+    total_value_usdc = (total_value_usdc * 100.0).round() / 100.0;
+
+    let response = BalanceResponse {
+        positions,
+        total_value_usdc,
+    };
+
+    serde_json::to_string(&response).map_err(|e| format!("Serialization error: {e}"))
+}
+
+fn resolve_single_token(token: &str, amap: &AliasMap) -> Result<TokenMetadata, String> {
+    if token.contains(':') {
+        return amap
+            .reverse_map
+            .get(token)
+            .cloned()
+            .ok_or_else(|| format!("Unknown asset ID: {token}"));
+    }
+    let key = token.trim().to_lowercase();
+    let matches = amap
+        .alias_map
+        .get(&key)
+        .ok_or_else(|| format!("Unknown token symbol: {token}"))?;
+    if matches.len() == 1 {
+        let m = &matches[0];
+        return amap
+            .reverse_map
+            .get(&m.asset_id)
+            .cloned()
+            .ok_or_else(|| format!("Unknown asset ID for symbol: {token}"));
+    }
+    let ids: Vec<&str> = matches.iter().map(|m| m.asset_id.as_str()).collect();
+    Err(format!(
+        "Ambiguous symbol '{token}' matches multiple tokens: {ids:?}. \
+         Please specify the full defuse asset ID."
+    ))
+}
+
+#[derive(Debug, Serialize)]
+struct SwapQuoteResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    correlation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amount_in: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amount_in_formatted: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amount_in_usd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amount_out: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amount_out_formatted: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amount_out_usd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_amount_out: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_estimate: Option<u64>,
+    deeplink: String,
+}
+
+fn get_swap_quote(
+    from_token: &str,
+    to_token: &str,
+    amount: &str,
+    account_id: &str,
+    slippage_bps: u32,
+    swap_type: &str,
+) -> Result<String, String> {
+    if from_token.is_empty() || to_token.is_empty() || amount.is_empty() || account_id.is_empty() {
+        return Err("from_token, to_token, amount, and account_id are all required".into());
+    }
+
+    let tokens = fetch_token_list()?;
+    let amap = build_alias_map(&tokens);
+
+    let origin = resolve_single_token(from_token, &amap)?;
+    let destination = resolve_single_token(to_token, &amap)?;
+
+    let raw_amount = human_to_raw(amount, origin.decimals)?;
+
+    let now_ms = near::agent::host::now_millis();
+    let deadline_secs = now_ms / 1000 + 600; // 10 minutes
+    let deadline = format_iso8601(deadline_secs);
+
+    let request = serde_json::json!({
+        "dry": true,
+        "swapType": swap_type,
+        "slippageTolerance": slippage_bps,
+        "originAsset": origin.defuse_asset_id,
+        "depositType": "INTENTS",
+        "destinationAsset": destination.defuse_asset_id,
+        "amount": raw_amount,
+        "refundTo": account_id,
+        "refundType": "INTENTS",
+        "recipient": account_id,
+        "recipientType": "INTENTS",
+        "deadline": deadline,
+    });
+
+    let headers = serde_json::json!({"Content-Type": "application/json"});
+    let payload = request.to_string().into_bytes();
+    let resp = near::agent::host::http_request(
+        "POST",
+        DEFUSE_QUOTE_URL,
+        &headers.to_string(),
+        Some(&payload),
+        None,
+    )
+    .map_err(|e| format!("Quote API request failed: {e}"))?;
+
+    if resp.status == 400 {
+        return Err(
+            "Failed to get swap quote — the amount may be too small for this route. \
+             Try a larger amount."
+                .into(),
+        );
+    }
+    if resp.status < 200 || resp.status >= 300 {
+        return Err(format!("Quote API returned status {}", resp.status));
+    }
+
+    let body = String::from_utf8(resp.body)
+        .map_err(|e| format!("Invalid UTF-8 in quote response: {e}"))?;
+    let data: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("Failed to parse quote response: {e}"))?;
+
+    let correlation_id = data.get("correlationId").and_then(|v| v.as_str()).map(String::from);
+
+    let quote = data
+        .get("quote")
+        .ok_or("Swap quote response missing 'quote' key")?;
+
+    let deeplink = format!(
+        "https://app.defuse.org/swap?correlationId={}&from={}&to={}&amount={}",
+        correlation_id.as_deref().unwrap_or(""),
+        origin.defuse_asset_id,
+        destination.defuse_asset_id,
+        amount,
+    );
+
+    let str_field = |key: &str| quote.get(key).and_then(|v| v.as_str()).map(String::from);
+
+    let response = SwapQuoteResponse {
+        correlation_id,
+        amount_in: str_field("amountIn"),
+        amount_in_formatted: str_field("amountInFormatted"),
+        amount_in_usd: str_field("amountInUsd"),
+        amount_out: str_field("amountOut"),
+        amount_out_formatted: str_field("amountOutFormatted"),
+        amount_out_usd: str_field("amountOutUsd"),
+        min_amount_out: str_field("minAmountOut"),
+        time_estimate: quote.get("timeEstimate").and_then(|v| v.as_u64()),
+        deeplink,
+    };
+
+    serde_json::to_string(&response).map_err(|e| format!("Serialization error: {e}"))
+}
+
+/// Convert a human-readable amount (e.g. "100.5") to raw integer string using decimals.
+fn human_to_raw(amount: &str, decimals: u32) -> Result<String, String> {
+    let amount = amount.trim();
+    let parts: Vec<&str> = amount.split('.').collect();
+    if parts.len() > 2 {
+        return Err(format!("Invalid amount: {amount}"));
+    }
+    let integer_part = parts[0];
+    let frac_part = if parts.len() == 2 { parts[1] } else { "" };
+
+    if frac_part.len() > decimals as usize {
+        return Err(format!(
+            "Amount has more decimal places ({}) than token supports ({decimals})",
+            frac_part.len()
+        ));
+    }
+
+    let padded_frac = format!("{:0<width$}", frac_part, width = decimals as usize);
+    let raw_str = format!("{integer_part}{padded_frac}");
+
+    let raw_str = raw_str.trim_start_matches('0');
+    if raw_str.is_empty() {
+        Ok("0".into())
+    } else {
+        Ok(raw_str.into())
+    }
+}
+
+/// Format a Unix timestamp as ISO 8601 UTC (simplified).
+fn format_iso8601(secs: u64) -> String {
+    let days_since_epoch = secs / 86400;
+    let time_of_day = secs % 86400;
+
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    let (year, month, day) = days_to_civil(days_since_epoch as i64);
+
+    format!(
+        "{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z"
+    )
+}
+
+/// Convert days since 1970-01-01 to (year, month, day).
+fn days_to_civil(days: i64) -> (i32, u32, u32) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m, d)
 }
 
 fn parse_balance(raw: &str, decimals: u32) -> f64 {
@@ -578,12 +880,12 @@ const SCHEMA: &str = r#"{
   "properties": {
     "action": {
       "type": "string",
-      "enum": ["resolve_token", "reverse_resolve_token", "get_balance"],
+      "enum": ["resolve_token", "reverse_resolve_token", "get_balance", "get_swap_quote"],
       "description": "Which action to perform"
     },
     "query": {
       "type": "string",
-      "description": "Token reference to resolve (for resolve_token). Examples: 'ethereum', 'USDC on arbitrum', 'wrapped near', 'bitcoin'."
+      "description": "Token reference to resolve (for resolve_token). Examples: 'ethereum', 'USDC on arbitrum', 'wrapped near', 'bitcoin'. Uses contiguous n-gram matching, so word order matters. To target a specific chain, use format '<symbol> on <chain>' as a single phrase."
     },
     "list_all": {
       "type": "boolean",
@@ -592,16 +894,36 @@ const SCHEMA: &str = r#"{
     },
     "asset_id": {
       "type": "string",
-      "description": "Defuse asset ID to look up (for reverse_resolve_token). Example: 'nep141:wrap.near'."
+      "description": "Defuse asset ID to look up (for reverse_resolve_token). Use this to get the ticker symbol (e.g. 'WBTC') from an asset ID (e.g. 'nep141:eth-0x2260...omft.near')."
     },
     "account_id": {
       "type": "string",
-      "description": "NEAR wallet address or account ID (for get_balance)."
+      "description": "NEAR wallet address or account ID (for get_balance and get_swap_quote). Either a named account (alice.near) or a 0x-prefixed hex address — pass verbatim, do NOT convert hex to decimal."
     },
     "token_ids": {
       "type": "array",
       "items": { "type": "string" },
       "description": "Specific defuse asset IDs to query (for get_balance). If omitted, returns all non-zero balances."
+    },
+    "from_token": {
+      "type": "string",
+      "description": "Token symbol (e.g. 'USDC') or defuse asset ID (e.g. 'nep141:usdc.near') to swap from (for get_swap_quote)."
+    },
+    "to_token": {
+      "type": "string",
+      "description": "Token symbol (e.g. 'ETH') or defuse asset ID (e.g. 'nep141:eth.near') to swap to (for get_swap_quote)."
+    },
+    "amount": {
+      "type": "string",
+      "description": "Human-readable amount to swap (e.g. '100.5') (for get_swap_quote)."
+    },
+    "slippage_bps": {
+      "type": "integer",
+      "description": "Slippage tolerance in basis points (for get_swap_quote). Default 100 (1%)."
+    },
+    "swap_type": {
+      "type": "string",
+      "description": "Swap type (for get_swap_quote): EXACT_INPUT (default) or EXACT_OUTPUT."
     }
   },
   "required": ["action"]
@@ -619,6 +941,7 @@ mod tests {
                 symbol: "wNEAR".into(),
                 blockchain: "near".into(),
                 contract_address: Some("wrap.near".into()),
+                price: Some(3.50),
             },
             TokenMetadata {
                 defuse_asset_id: "nep141:usdc.near".into(),
@@ -626,6 +949,7 @@ mod tests {
                 symbol: "USDC".into(),
                 blockchain: "near".into(),
                 contract_address: Some("usdc.near".into()),
+                price: Some(1.0),
             },
             TokenMetadata {
                 defuse_asset_id: "nep141:eth-usdc.arb".into(),
@@ -633,6 +957,7 @@ mod tests {
                 symbol: "USDC".into(),
                 blockchain: "arbitrum".into(),
                 contract_address: Some("0xa0b8...".into()),
+                price: Some(1.0),
             },
             TokenMetadata {
                 defuse_asset_id: "nep141:eth.near".into(),
@@ -640,6 +965,7 @@ mod tests {
                 symbol: "ETH".into(),
                 blockchain: "eth".into(),
                 contract_address: None,
+                price: Some(2500.0),
             },
             TokenMetadata {
                 defuse_asset_id: "nep141:wbtc.near".into(),
@@ -647,6 +973,7 @@ mod tests {
                 symbol: "WBTC".into(),
                 blockchain: "eth".into(),
                 contract_address: None,
+                price: Some(60000.0),
             },
         ]
     }
@@ -804,6 +1131,95 @@ mod tests {
             } => {
                 assert_eq!(account_id, "test.near");
                 assert!(token_ids.is_none());
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_normalize_account_id_passthrough() {
+        assert_eq!(normalize_account_id("alice.near"), "alice.near");
+        assert_eq!(normalize_account_id("0xabc123"), "0xabc123");
+    }
+
+    #[test]
+    fn test_normalize_account_id_decimal_to_hex() {
+        let decimal = "1271270613000041655817448348132275889066893754095";
+        assert!(decimal.len() > 40);
+        let result = normalize_account_id(decimal);
+        assert_eq!(result, "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+    }
+
+    #[test]
+    fn test_decimal_to_hex() {
+        assert_eq!(decimal_to_hex("255"), "ff");
+        assert_eq!(decimal_to_hex("16"), "10");
+        assert_eq!(decimal_to_hex("0"), "0");
+        assert_eq!(decimal_to_hex("256"), "100");
+    }
+
+    #[test]
+    fn test_human_to_raw() {
+        assert_eq!(human_to_raw("100", 6).unwrap(), "100000000");
+        assert_eq!(human_to_raw("100.5", 6).unwrap(), "100500000");
+        assert_eq!(human_to_raw("0.000001", 6).unwrap(), "1");
+        assert_eq!(human_to_raw("0", 6).unwrap(), "0");
+        assert_eq!(human_to_raw("1", 18).unwrap(), "1000000000000000000");
+        assert!(human_to_raw("1.1234567", 6).is_err()); // too many decimals
+    }
+
+    #[test]
+    fn test_format_iso8601() {
+        // 2024-01-01T00:00:00Z = 1704067200
+        let result = format_iso8601(1704067200);
+        assert_eq!(result, "2024-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_resolve_single_token_by_asset_id() {
+        let tokens = sample_tokens();
+        let amap = build_alias_map(&tokens);
+        let meta = resolve_single_token("nep141:wrap.near", &amap).unwrap();
+        assert_eq!(meta.symbol, "wNEAR");
+    }
+
+    #[test]
+    fn test_resolve_single_token_by_symbol_unique() {
+        let tokens = sample_tokens();
+        let amap = build_alias_map(&tokens);
+        let meta = resolve_single_token("wNEAR", &amap).unwrap();
+        assert_eq!(meta.defuse_asset_id, "nep141:wrap.near");
+    }
+
+    #[test]
+    fn test_resolve_single_token_ambiguous() {
+        let tokens = sample_tokens();
+        let amap = build_alias_map(&tokens);
+        // USDC exists on multiple chains
+        let result = resolve_single_token("USDC", &amap);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Ambiguous"));
+    }
+
+    #[test]
+    fn test_action_deserialize_swap_quote() {
+        let json = r#"{"action": "get_swap_quote", "from_token": "USDC", "to_token": "ETH", "amount": "100", "account_id": "alice.near"}"#;
+        let action: Action = serde_json::from_str(json).unwrap();
+        match action {
+            Action::GetSwapQuote {
+                from_token,
+                to_token,
+                amount,
+                account_id,
+                slippage_bps,
+                swap_type,
+            } => {
+                assert_eq!(from_token, "USDC");
+                assert_eq!(to_token, "ETH");
+                assert_eq!(amount, "100");
+                assert_eq!(account_id, "alice.near");
+                assert!(slippage_bps.is_none());
+                assert!(swap_type.is_none());
             }
             _ => panic!("Wrong variant"),
         }
