@@ -2,10 +2,13 @@
 //!
 //! Each module groups related endpoint handlers by domain.
 
+pub mod invitations;
 pub mod jobs;
 pub mod memory;
 pub mod routines;
 pub mod skills;
+pub mod tokens;
+pub mod users;
 
 // Modules not yet wired into server.rs router -- suppress dead_code until
 // they replace their inline counterparts.

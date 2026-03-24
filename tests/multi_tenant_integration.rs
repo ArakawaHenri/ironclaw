@@ -73,7 +73,10 @@ fn user_echo_app(auth: MultiAuthState) -> Router {
         .route("/api/whoami/scopes", get(echo_user_with_scopes))
         .route("/api/action", post(echo_user))
         .route("/api/chat/events", get(echo_user)) // SSE endpoint (allows query token)
-        .layer(middleware::from_fn_with_state(auth, auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            ironclaw::channels::web::auth::CombinedAuthState::from(auth),
+            auth_middleware,
+        ))
 }
 
 // ===========================================================================
@@ -905,7 +908,7 @@ async fn start_multi_user_server_with_db() -> (
     });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let bound = ironclaw::channels::web::server::start_server(addr, state.clone(), auth)
+    let bound = ironclaw::channels::web::server::start_server(addr, state.clone(), auth.into())
         .await
         .expect("Failed to start server with DB");
 

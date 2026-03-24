@@ -31,7 +31,7 @@ use crate::bootstrap::ironclaw_base_dir;
 use crate::channels::IncomingMessage;
 use crate::channels::relay::DEFAULT_RELAY_NAME;
 use crate::channels::web::auth::{
-    AuthenticatedUser, MultiAuthState, UserIdentity, auth_middleware,
+    AuthenticatedUser, CombinedAuthState, UserIdentity, auth_middleware,
 };
 use crate::channels::web::handlers::jobs::{
     job_files_list_handler, job_files_read_handler, jobs_cancel_handler, jobs_detail_handler,
@@ -384,7 +384,7 @@ pub struct GatewayState {
 pub async fn start_server(
     addr: SocketAddr,
     state: Arc<GatewayState>,
-    auth: MultiAuthState,
+    auth: CombinedAuthState,
 ) -> Result<SocketAddr, crate::error::ChannelError> {
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
         crate::error::ChannelError::StartupFailed {
@@ -509,6 +509,45 @@ pub async fn start_server(
         .route(
             "/api/settings/{key}",
             axum::routing::delete(settings_delete_handler),
+        )
+        // User management (admin)
+        .route(
+            "/api/admin/users",
+            get(super::handlers::users::users_list_handler)
+                .post(super::handlers::users::users_create_handler),
+        )
+        .route(
+            "/api/admin/users/{id}",
+            get(super::handlers::users::users_detail_handler)
+                .patch(super::handlers::users::users_update_handler),
+        )
+        .route(
+            "/api/admin/users/{id}/suspend",
+            post(super::handlers::users::users_suspend_handler),
+        )
+        .route(
+            "/api/admin/users/{id}/activate",
+            post(super::handlers::users::users_activate_handler),
+        )
+        // Token management
+        .route(
+            "/api/tokens",
+            get(super::handlers::tokens::tokens_list_handler)
+                .post(super::handlers::tokens::tokens_create_handler),
+        )
+        .route(
+            "/api/tokens/{id}",
+            axum::routing::delete(super::handlers::tokens::tokens_revoke_handler),
+        )
+        // Invitations
+        .route(
+            "/api/invitations",
+            get(super::handlers::invitations::invitations_list_handler)
+                .post(super::handlers::invitations::invitations_create_handler),
+        )
+        .route(
+            "/api/invitations/accept",
+            post(super::handlers::invitations::invitations_accept_handler),
         )
         // Gateway control plane
         .route("/api/gateway/status", get(gateway_status_handler))
@@ -3195,7 +3234,10 @@ mod tests {
         let state = test_gateway_state(None);
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let auth = MultiAuthState::single("test-token".to_string(), "test".to_string());
+        let auth = CombinedAuthState::from(crate::channels::web::auth::MultiAuthState::single(
+            "test-token".to_string(),
+            "test".to_string(),
+        ));
         let bound = start_server(addr, state.clone(), auth)
             .await
             .expect("server should start");

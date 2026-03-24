@@ -13,7 +13,12 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
+use std::time::Instant;
 use subtle::ConstantTimeEq;
+use tokio::sync::RwLock;
+
+use crate::db::Database;
 
 /// Identity resolved from a bearer token.
 #[derive(Debug, Clone)]
@@ -108,6 +113,96 @@ impl MultiAuthState {
     }
 }
 
+/// DB-backed token authenticator with an in-memory LRU cache.
+///
+/// Checks an LRU cache first (TTL 60s), then falls back to a DB query.
+/// Cache entries expire naturally — revoking a token or suspending a user
+/// has at most 60s of stale authentication before the cache entry expires.
+#[derive(Clone)]
+#[allow(clippy::type_complexity)]
+pub struct DbAuthenticator {
+    store: Arc<dyn Database>,
+    /// LRU cache: token_hash → (identity, inserted_at).
+    cache: Arc<RwLock<HashMap<[u8; 32], (UserIdentity, Instant)>>>,
+}
+
+impl DbAuthenticator {
+    /// Cache TTL — how long a successful auth is cached before re-querying the DB.
+    const CACHE_TTL_SECS: u64 = 60;
+    /// Maximum cache entries to prevent unbounded growth.
+    const MAX_CACHE_ENTRIES: usize = 1024;
+
+    pub fn new(store: Arc<dyn Database>) -> Self {
+        Self {
+            store,
+            cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Authenticate a token against the database, using cache when possible.
+    pub async fn authenticate(&self, candidate: &str) -> Option<UserIdentity> {
+        let hash = hash_token(candidate);
+
+        // Check cache first
+        {
+            let cache = self.cache.read().await;
+            if let Some((identity, inserted_at)) = cache.get(&hash)
+                && inserted_at.elapsed().as_secs() < Self::CACHE_TTL_SECS
+            {
+                return Some(identity.clone());
+            }
+        }
+
+        // Cache miss or expired — query DB
+        let (token_record, user_record) = self.store.authenticate_token(&hash).await.ok()??;
+
+        let identity = UserIdentity {
+            user_id: user_record.id.clone(),
+            workspace_read_scopes: Vec::new(), // DB-backed users don't have static scopes yet
+        };
+
+        // Record token usage (best-effort, don't block auth)
+        let store = self.store.clone();
+        let token_id = token_record.id;
+        let user_id = user_record.id;
+        tokio::spawn(async move {
+            let _ = store.record_token_usage(token_id).await;
+            let _ = store.record_login(&user_id).await;
+        });
+
+        // Update cache
+        {
+            let mut cache = self.cache.write().await;
+            // Evict stale entries if cache is full
+            if cache.len() >= Self::MAX_CACHE_ENTRIES {
+                let now = Instant::now();
+                cache.retain(|_, (_, ts)| now.duration_since(*ts).as_secs() < Self::CACHE_TTL_SECS);
+            }
+            cache.insert(hash, (identity.clone(), Instant::now()));
+        }
+
+        Some(identity)
+    }
+}
+
+/// Combined auth state: tries env-var tokens first, then DB-backed tokens.
+#[derive(Clone)]
+pub struct CombinedAuthState {
+    /// In-memory tokens from GATEWAY_USER_TOKENS or GATEWAY_AUTH_TOKEN.
+    pub env_auth: MultiAuthState,
+    /// DB-backed token authenticator (optional — only when a database is available).
+    pub db_auth: Option<DbAuthenticator>,
+}
+
+impl From<MultiAuthState> for CombinedAuthState {
+    fn from(env_auth: MultiAuthState) -> Self {
+        Self {
+            env_auth,
+            db_auth: None,
+        }
+    }
+}
+
 /// Axum extractor that provides the authenticated user identity.
 ///
 /// Only available on routes behind `auth_middleware`. Extracts the
@@ -166,39 +261,58 @@ fn query_token(request: &Request) -> Option<String> {
 
 /// Auth middleware that validates bearer token from header or query param.
 ///
-/// SSE connections can't set headers from `EventSource`, so we also accept
-/// `?token=xxx` as a query parameter, but only on SSE/WS endpoints.
+/// Tries env-var tokens first (constant-time, in-memory), then falls back
+/// to DB-backed token lookup if configured. SSE connections can't set
+/// headers from `EventSource`, so we also accept `?token=xxx` as a query
+/// parameter, but only on SSE/WS endpoints.
 ///
 /// On successful authentication, inserts the matching `UserIdentity` into
 /// request extensions for downstream extraction via `AuthenticatedUser`.
 pub async fn auth_middleware(
-    State(auth): State<MultiAuthState>,
+    State(auth): State<CombinedAuthState>,
     headers: HeaderMap,
     mut request: Request,
     next: Next,
 ) -> Response {
-    // Try Authorization header first.
-    // RFC 6750 Section 2.1: auth-scheme comparison is case-insensitive.
+    // Extract the candidate token from header or query param.
+    let token = extract_token(&headers, &request);
+
+    if let Some(ref tok) = token {
+        // 1. Try env-var tokens first (fast, constant-time, in-memory).
+        if let Some(identity) = auth.env_auth.authenticate(tok) {
+            request.extensions_mut().insert(identity.clone());
+            return next.run(request).await;
+        }
+
+        // 2. Fall back to DB-backed token lookup.
+        if let Some(ref db_auth) = auth.db_auth
+            && let Some(identity) = db_auth.authenticate(tok).await
+        {
+            request.extensions_mut().insert(identity);
+            return next.run(request).await;
+        }
+    }
+
+    (StatusCode::UNAUTHORIZED, "Invalid or missing auth token").into_response()
+}
+
+/// Extract a bearer token from the Authorization header or query parameter.
+fn extract_token(headers: &HeaderMap, request: &Request) -> Option<String> {
+    // Try Authorization header first (RFC 6750).
     if let Some(auth_header) = headers.get("authorization")
         && let Ok(value) = auth_header.to_str()
         && value.len() > 7
         && value[..7].eq_ignore_ascii_case("Bearer ")
-        && let Some(identity) = auth.authenticate(&value[7..])
     {
-        request.extensions_mut().insert(identity.clone());
-        return next.run(request).await;
+        return Some(value[7..].to_string());
     }
 
-    // Fall back to query parameter, but only for SSE/WS endpoints.
-    if allows_query_token_auth(&request)
-        && let Some(token) = query_token(&request)
-        && let Some(identity) = auth.authenticate(&token)
-    {
-        request.extensions_mut().insert(identity.clone());
-        return next.run(request).await;
+    // Fall back to query parameter for SSE/WS endpoints.
+    if allows_query_token_auth(request) {
+        return query_token(request);
     }
 
-    (StatusCode::UNAUTHORIZED, "Invalid or missing auth token").into_response()
+    None
 }
 
 #[cfg(test)]
@@ -274,7 +388,10 @@ mod tests {
     /// Router with streaming endpoints (query auth allowed) and regular
     /// endpoints (query auth rejected).
     fn test_app(token: &str) -> Router {
-        let state = MultiAuthState::single(token.to_string(), "test-user".to_string());
+        let state = CombinedAuthState::from(MultiAuthState::single(
+            token.to_string(),
+            "test-user".to_string(),
+        ));
         Router::new()
             .route("/api/chat/events", get(dummy_handler))
             .route("/api/logs/events", get(dummy_handler))
@@ -486,7 +603,7 @@ mod tests {
 
     /// Build a multi-user router where each token maps to a distinct identity.
     fn multi_user_app(tokens: HashMap<String, UserIdentity>) -> Router {
-        let state = MultiAuthState::multi(tokens);
+        let state = CombinedAuthState::from(MultiAuthState::multi(tokens));
         Router::new()
             .route("/api/chat/events", get(identity_handler))
             .route("/api/chat/send", post(identity_handler))
@@ -643,7 +760,10 @@ mod tests {
     #[tokio::test]
     async fn test_multi_user_empty_scopes_for_single_user() {
         // Single-user mode creates identity with empty workspace_read_scopes.
-        let state = MultiAuthState::single("tok-only".to_string(), "solo".to_string());
+        let state = CombinedAuthState::from(MultiAuthState::single(
+            "tok-only".to_string(),
+            "solo".to_string(),
+        ));
         let app = Router::new()
             .route("/api/scopes", get(scopes_handler))
             .layer(middleware::from_fn_with_state(state, auth_middleware));

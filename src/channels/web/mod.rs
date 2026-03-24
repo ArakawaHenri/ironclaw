@@ -55,7 +55,7 @@ use crate::workspace::Workspace;
 
 use self::log_layer::{LogBroadcaster, LogLevelHandle};
 
-use self::auth::MultiAuthState;
+use self::auth::{CombinedAuthState, DbAuthenticator, MultiAuthState};
 use self::server::GatewayState;
 use self::sse::SseManager;
 use self::types::SseEvent;
@@ -64,8 +64,8 @@ use self::types::SseEvent;
 pub struct GatewayChannel {
     config: GatewayConfig,
     state: Arc<GatewayState>,
-    /// Multi-user auth state (replaces bare auth_token).
-    auth: MultiAuthState,
+    /// Combined auth state: env-var tokens + optional DB-backed tokens.
+    auth: CombinedAuthState,
 }
 
 impl GatewayChannel {
@@ -82,7 +82,10 @@ impl GatewayChannel {
             bytes.iter().map(|b| format!("{b:02x}")).collect()
         });
 
-        let auth = MultiAuthState::single(auth_token, config.user_id.clone());
+        let auth = CombinedAuthState {
+            env_auth: MultiAuthState::single(auth_token, config.user_id.clone()),
+            db_auth: None,
+        };
 
         let state = Arc::new(GatewayState {
             msg_tx: tokio::sync::RwLock::new(None),
@@ -123,6 +126,10 @@ impl GatewayChannel {
 
     /// Create a gateway channel with a pre-built multi-user auth state.
     pub fn new_multi_auth(config: GatewayConfig, auth: MultiAuthState) -> Self {
+        let auth = CombinedAuthState {
+            env_auth: auth,
+            db_auth: None,
+        };
         let state = Arc::new(GatewayState {
             msg_tx: tokio::sync::RwLock::new(None),
             sse: Arc::new(SseManager::new()),
@@ -238,6 +245,12 @@ impl GatewayChannel {
         self
     }
 
+    /// Enable DB-backed token authentication alongside env-var tokens.
+    pub fn with_db_auth(mut self, store: Arc<dyn Database>) -> Self {
+        self.auth.db_auth = Some(DbAuthenticator::new(store));
+        self
+    }
+
     /// Inject the container job manager for sandbox operations.
     pub fn with_job_manager(mut self, jm: Arc<ContainerJobManager>) -> Self {
         self.rebuild_state(|s| s.job_manager = Some(jm));
@@ -316,7 +329,7 @@ impl GatewayChannel {
 
     /// Get the first auth token (for printing to console on startup).
     pub fn auth_token(&self) -> &str {
-        self.auth.first_token().unwrap_or("")
+        self.auth.env_auth.first_token().unwrap_or("")
     }
 
     /// Get a reference to the shared gateway state (for the agent to push SSE events).

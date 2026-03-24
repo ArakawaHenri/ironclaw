@@ -340,7 +340,10 @@ mod jobs_isolation {
             .route("/api/jobs/{id}/cancel", post(jobs_cancel_handler))
             .route("/api/jobs/{id}/restart", post(jobs_restart_handler))
             .route("/api/jobs/{id}/prompt", post(jobs_prompt_handler))
-            .layer(middleware::from_fn_with_state(auth, auth_middleware))
+            .layer(middleware::from_fn_with_state(
+                crate::channels::web::auth::CombinedAuthState::from(auth),
+                auth_middleware,
+            ))
             .with_state(state)
     }
 
@@ -546,7 +549,10 @@ mod routines_isolation {
             .route("/api/routines/{id}", get(routines_detail_handler))
             .route("/api/routines/{id}/toggle", post(routines_toggle_handler))
             .route("/api/routines/{id}", delete(routines_delete_handler))
-            .layer(middleware::from_fn_with_state(auth, auth_middleware))
+            .layer(middleware::from_fn_with_state(
+                crate::channels::web::auth::CombinedAuthState::from(auth),
+                auth_middleware,
+            ))
             .with_state(state)
     }
 
@@ -671,7 +677,10 @@ mod auth_enforcement {
             .route("/api/logs/level", get(authed_handler).put(authed_handler))
             // Gateway status
             .route("/api/gateway/status", get(authed_handler))
-            .layer(middleware::from_fn_with_state(auth, auth_middleware))
+            .layer(middleware::from_fn_with_state(
+                crate::channels::web::auth::CombinedAuthState::from(auth),
+                auth_middleware,
+            ))
             .with_state(state)
     }
 

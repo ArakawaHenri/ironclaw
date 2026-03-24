@@ -297,7 +297,7 @@ impl GatewayWorkflowHarness {
         let addr = start_server(
             "127.0.0.1:0".parse().expect("valid localhost addr"),
             Arc::clone(&gateway_state),
-            auth,
+            auth.into(),
         )
         .await
         .expect("failed to start gateway server");
