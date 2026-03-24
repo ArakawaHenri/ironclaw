@@ -227,6 +227,11 @@ impl CostGuard {
                 daily.reset_date = today;
                 self.budget_exceeded.store(false, Ordering::Relaxed);
                 tracing::info!("Cost guard: daily counter reset for {}", today);
+
+                // Prune per-user entries from previous days to prevent
+                // unbounded HashMap growth in long-lived deployments.
+                let mut per_user = self.per_user_daily_cost.lock().await;
+                per_user.retain(|_, entry| entry.reset_date == today);
             }
             daily.total += cost;
 

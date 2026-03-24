@@ -512,10 +512,10 @@ pub fn spawn_heartbeat(
     })
 }
 
-/// Spawn a multi-user heartbeat runner that cycles through all users with
-/// active routines. Each tick, it queries the DB for distinct user_ids that
-/// own routines, creates a per-user workspace, and runs a heartbeat check
-/// for each user.
+/// Spawn a multi-user heartbeat runner that cycles through all users that
+/// own routines (enabled or not). Each tick, it queries the DB for distinct
+/// user_ids, creates a per-user workspace, and runs a heartbeat check for
+/// each user concurrently. Per-user failure counts are tracked independently.
 pub fn spawn_multi_user_heartbeat(
     config: HeartbeatConfig,
     hygiene_config: HygieneConfig,
@@ -536,6 +536,11 @@ pub fn spawn_multi_user_heartbeat(
         } else {
             None
         };
+
+        // Track consecutive failures per user so we can disable heartbeat
+        // for persistently-failing users (same semantics as single-user mode).
+        let mut user_failures: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
 
         tracing::info!("Starting multi-user heartbeat loop");
 
@@ -569,7 +574,17 @@ pub fn spawn_multi_user_heartbeat(
                 }
             };
 
+            // Run all user heartbeats concurrently so one slow LLM call
+            // doesn't block others.
+            let mut join_set = tokio::task::JoinSet::new();
+
             for user_id in &user_ids {
+                // Skip users that have exceeded max_failures
+                let failures = user_failures.get(user_id).copied().unwrap_or(0);
+                if failures >= config.max_failures {
+                    continue;
+                }
+
                 let workspace = Arc::new(Workspace::new_with_db(user_id, store.clone()));
 
                 // Run memory hygiene per user (same as single-user heartbeat).
@@ -589,28 +604,56 @@ pub fn spawn_multi_user_heartbeat(
                     }
                 });
 
-                let mut runner = HeartbeatRunner::new(
-                    config.clone(),
-                    hygiene_config.clone(),
-                    workspace,
-                    llm.clone(),
-                );
-                if let Some(ref tx) = response_tx {
-                    runner = runner.with_response_channel(tx.clone());
-                }
-                runner = runner.with_store(store.clone());
+                let uid = user_id.clone();
+                let cfg = config.clone();
+                let hyg = hygiene_config.clone();
+                let llm_clone = llm.clone();
+                let tx = response_tx.clone();
+                let st = store.clone();
 
-                match runner.check_heartbeat().await {
-                    HeartbeatResult::Ok => {
-                        tracing::trace!(user_id, "Multi-user heartbeat OK");
+                join_set.spawn(async move {
+                    let mut runner = HeartbeatRunner::new(cfg, hyg, workspace, llm_clone);
+                    if let Some(tx) = tx {
+                        runner = runner.with_response_channel(tx);
                     }
-                    HeartbeatResult::NeedsAttention(msg) => {
-                        tracing::info!(user_id, "Multi-user heartbeat needs attention");
-                        runner.send_notification(&msg).await;
+                    runner = runner.with_store(st);
+
+                    let result = runner.check_heartbeat().await;
+                    if let HeartbeatResult::NeedsAttention(msg) = &result {
+                        runner.send_notification(msg).await;
+                    }
+                    (uid, result)
+                });
+            }
+
+            // Collect results and update failure counts
+            while let Some(Ok((uid, result))) = join_set.join_next().await {
+                match result {
+                    HeartbeatResult::Ok => {
+                        tracing::trace!(user_id = uid, "Multi-user heartbeat OK");
+                        user_failures.remove(&uid);
+                    }
+                    HeartbeatResult::NeedsAttention(_) => {
+                        tracing::info!(user_id = uid, "Multi-user heartbeat needs attention");
+                        user_failures.remove(&uid);
                     }
                     HeartbeatResult::Skipped => {}
                     HeartbeatResult::Failed(err) => {
-                        tracing::error!(user_id, "Multi-user heartbeat failed: {}", err);
+                        let count = user_failures.entry(uid.clone()).or_insert(0);
+                        *count += 1;
+                        tracing::error!(
+                            user_id = uid,
+                            consecutive_failures = *count,
+                            "Multi-user heartbeat failed: {}",
+                            err
+                        );
+                        if *count >= config.max_failures {
+                            tracing::error!(
+                                user_id = uid,
+                                "Multi-user heartbeat disabled for user after {} consecutive failures",
+                                count
+                            );
+                        }
                     }
                 }
             }
