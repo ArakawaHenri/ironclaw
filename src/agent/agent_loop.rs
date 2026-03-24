@@ -304,7 +304,7 @@ impl Agent {
         self.deps.workspace.as_ref()
     }
 
-    pub(super) fn hooks(&self) -> &Arc<HookRegistry> {
+    pub(crate) fn hooks(&self) -> &Arc<HookRegistry> {
         &self.deps.hooks
     }
 

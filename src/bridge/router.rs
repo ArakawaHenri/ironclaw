@@ -61,6 +61,7 @@ async fn get_or_init_engine(agent: &Agent) -> Result<(), Error> {
     let effect_adapter = Arc::new(EffectBridgeAdapter::new(
         agent.tools().clone(),
         agent.safety().clone(),
+        agent.hooks().clone(),
     ));
 
     let store = Arc::new(InMemoryStore::new());
