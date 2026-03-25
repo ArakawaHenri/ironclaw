@@ -30,12 +30,34 @@ pub async fn settings_list_handler(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    // Build a map of sensitive keys so we can annotate and mask them.
+    let sensitive_keys = ["llm_builtin_overrides", "llm_custom_providers"];
+    let mut sensitive_map: std::collections::HashMap<String, serde_json::Value> = rows
+        .iter()
+        .filter(|r| sensitive_keys.contains(&r.key.as_str()))
+        .map(|r| (r.key.clone(), r.value.clone()))
+        .collect();
+    if !sensitive_map.is_empty() {
+        annotate_secret_key_presence(&state, &user.user_id, &mut sensitive_map).await;
+        mask_settings_api_keys(&mut sensitive_map);
+    }
+
     let settings = rows
         .into_iter()
-        .map(|r| SettingResponse {
-            key: r.key,
-            value: r.value,
-            updated_at: r.updated_at.to_rfc3339(),
+        .map(|r| {
+            let value = if sensitive_keys.contains(&r.key.as_str()) {
+                sensitive_map
+                    .get(&r.key)
+                    .cloned()
+                    .unwrap_or(r.value.clone())
+            } else {
+                r.value
+            };
+            SettingResponse {
+                key: r.key,
+                value,
+                updated_at: r.updated_at.to_rfc3339(),
+            }
         })
         .collect();
 
@@ -60,9 +82,22 @@ pub async fn settings_get_handler(
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
 
+    // Mask any plaintext API keys that may exist from legacy data.
+    let value = if matches!(
+        key.as_str(),
+        "llm_builtin_overrides" | "llm_custom_providers"
+    ) {
+        let mut map = std::collections::HashMap::from([(key.clone(), row.value.clone())]);
+        annotate_secret_key_presence(&state, &user.user_id, &mut map).await;
+        mask_settings_api_keys(&mut map);
+        map.remove(&key).unwrap_or(row.value)
+    } else {
+        row.value
+    };
+
     Ok(Json(SettingResponse {
         key: row.key,
-        value: row.value,
+        value,
         updated_at: row.updated_at.to_rfc3339(),
     }))
 }
@@ -241,8 +276,21 @@ pub async fn settings_import_handler(
         .store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    // Vault any API keys present in the imported settings, same as the
+    // individual SET handler does, so plaintext keys never reach the DB.
+    let mut sanitized = body.settings.clone();
+    if let Some(v) = sanitized.get("llm_builtin_overrides").cloned() {
+        let clean = extract_builtin_override_keys(&state, &user.user_id, &v).await?;
+        sanitized.insert("llm_builtin_overrides".to_string(), clean);
+    }
+    if let Some(v) = sanitized.get("llm_custom_providers").cloned() {
+        let clean = extract_custom_provider_keys(&state, &user.user_id, &v).await?;
+        sanitized.insert("llm_custom_providers".to_string(), clean);
+    }
+
     store
-        .set_all_settings(&user.user_id, &body.settings)
+        .set_all_settings(&user.user_id, &sanitized)
         .await
         .map_err(|e| {
             tracing::error!("Failed to import settings: {}", e);
@@ -266,19 +314,45 @@ fn custom_secret_name(provider_id: &str) -> String {
     format!("llm_custom_{}_api_key", provider_id)
 }
 
+/// Returns true if the `api_key` value is a real key (not sentinel/empty).
+fn is_real_api_key(key: &str) -> bool {
+    !key.is_empty() && key != API_KEY_UNCHANGED
+}
+
+/// Require the secrets store when real API keys are present.
+/// Returns `Ok(None)` when no secrets store and no real keys (passthrough).
+fn require_secrets_store(
+    state: &GatewayState,
+    has_real_keys: bool,
+) -> Result<Option<&Arc<dyn SecretsStore + Send + Sync>>, StatusCode> {
+    match state.secrets_store.as_ref() {
+        Some(s) => Ok(Some(s)),
+        None if has_real_keys => {
+            tracing::error!("Cannot store API keys: secrets store is not available");
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        }
+        None => Ok(None),
+    }
+}
+
 /// Extract API keys from builtin overrides, store in secrets, return sanitized JSON.
 async fn extract_builtin_override_keys(
     state: &GatewayState,
     user_id: &str,
     value: &serde_json::Value,
 ) -> Result<serde_json::Value, StatusCode> {
-    let secrets = match state.secrets_store.as_ref() {
-        Some(s) => s,
+    let obj = match value.as_object() {
+        Some(o) => o,
         None => return Ok(value.clone()),
     };
 
-    let obj = match value.as_object() {
-        Some(o) => o,
+    let has_real_keys = obj.values().any(|v| {
+        v.get("api_key")
+            .and_then(|k| k.as_str())
+            .is_some_and(is_real_api_key)
+    });
+    let secrets = match require_secrets_store(state, has_real_keys)? {
+        Some(s) => s,
         None => return Ok(value.clone()),
     };
 
@@ -286,7 +360,7 @@ async fn extract_builtin_override_keys(
 
     for (provider_id, override_val) in obj {
         if let Some(api_key) = override_val.get("api_key").and_then(|v| v.as_str()) {
-            if api_key == API_KEY_UNCHANGED || api_key.is_empty() {
+            if !is_real_api_key(api_key) {
                 // Unchanged or empty — remove from settings, keep existing secret.
                 if let Some(o) = sanitized
                     .get_mut(provider_id)
@@ -322,13 +396,18 @@ async fn extract_custom_provider_keys(
     user_id: &str,
     value: &serde_json::Value,
 ) -> Result<serde_json::Value, StatusCode> {
-    let secrets = match state.secrets_store.as_ref() {
-        Some(s) => s,
+    let arr = match value.as_array() {
+        Some(a) => a,
         None => return Ok(value.clone()),
     };
 
-    let arr = match value.as_array() {
-        Some(a) => a,
+    let has_real_keys = arr.iter().any(|v| {
+        v.get("api_key")
+            .and_then(|k| k.as_str())
+            .is_some_and(is_real_api_key)
+    });
+    let secrets = match require_secrets_store(state, has_real_keys)? {
+        Some(s) => s,
         None => return Ok(value.clone()),
     };
 
@@ -344,7 +423,7 @@ async fn extract_custom_provider_keys(
         }
 
         if let Some(api_key) = provider_val.get("api_key").and_then(|v| v.as_str()) {
-            if api_key == API_KEY_UNCHANGED || api_key.is_empty() {
+            if !is_real_api_key(api_key) {
                 if let Some(o) = sanitized[idx].as_object_mut() {
                     o.remove("api_key");
                 }
@@ -708,5 +787,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(decrypted.expose(), "sk-original");
+    }
+
+    /// When secrets store is unavailable, attempting to save a real API key
+    /// must fail with 503 rather than silently storing plaintext.
+    #[tokio::test]
+    async fn test_extract_builtin_keys_rejects_without_secrets_store() {
+        let state = GatewayState {
+            secrets_store: None,
+            ..test_gateway_state(test_secrets_store())
+        };
+
+        let input = serde_json::json!({
+            "openai": { "api_key": "sk-real-key", "model": "gpt-4" }
+        });
+
+        let err = extract_builtin_override_keys(&state, "test", &input)
+            .await
+            .unwrap_err();
+        assert_eq!(err, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// When secrets store is unavailable but no real keys are present
+    /// (only sentinels or no api_key at all), the call should succeed.
+    #[tokio::test]
+    async fn test_extract_builtin_keys_allows_no_keys_without_secrets_store() {
+        let state = GatewayState {
+            secrets_store: None,
+            ..test_gateway_state(test_secrets_store())
+        };
+
+        let input = serde_json::json!({
+            "openai": { "api_key": "••••••••", "model": "gpt-4" },
+            "anthropic": { "model": "claude-3" }
+        });
+
+        let result = extract_builtin_override_keys(&state, "test", &input)
+            .await
+            .unwrap();
+        // Without secrets store, the value passes through unchanged (no vaulting needed).
+        assert!(result.as_object().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_extract_custom_keys_rejects_without_secrets_store() {
+        let state = GatewayState {
+            secrets_store: None,
+            ..test_gateway_state(test_secrets_store())
+        };
+
+        let input = serde_json::json!([
+            { "id": "my-llm", "api_key": "gsk-real-key", "adapter": "open_ai_completions" }
+        ]);
+
+        let err = extract_custom_provider_keys(&state, "test", &input)
+            .await
+            .unwrap_err();
+        assert_eq!(err, StatusCode::SERVICE_UNAVAILABLE);
     }
 }

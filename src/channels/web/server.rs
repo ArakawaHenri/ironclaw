@@ -2610,12 +2610,23 @@ async fn routines_runs_handler(
     })))
 }
 
+/// Fields shared by `test_connection` and `list_models` requests.
+///
+/// When `api_key` is absent the handler falls back to the encrypted secrets
+/// store, using `provider_id` + `provider_type` to locate the vaulted key.
 #[derive(serde::Deserialize)]
 struct TestConnectionRequest {
     adapter: String,
     base_url: String,
     #[serde(default)]
     api_key: Option<String>,
+    /// Provider identifier used to look up the vaulted API key when `api_key`
+    /// is not supplied by the frontend (key already stored in secrets).
+    #[serde(default)]
+    provider_id: Option<String>,
+    /// `"builtin"` or `"custom"` — determines the secret name prefix.
+    #[serde(default)]
+    provider_type: Option<String>,
     /// Accepted for backward compatibility with frontends that still send it,
     /// but no longer used since test_connection switched to `GET /models`.
     #[serde(default)]
@@ -2630,9 +2641,49 @@ struct TestConnectionResponse {
 }
 
 async fn llm_test_connection_handler(
-    Json(body): Json<TestConnectionRequest>,
+    State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+    Json(mut body): Json<TestConnectionRequest>,
 ) -> Json<TestConnectionResponse> {
+    resolve_api_key_from_secrets(
+        &state,
+        &user.user_id,
+        &mut body.api_key,
+        &body.provider_id,
+        &body.provider_type,
+    )
+    .await;
     Json(test_provider_connection(body).await)
+}
+
+/// When the frontend doesn't supply an `api_key` (because it was already vaulted),
+/// look it up from the encrypted secrets store using `provider_id` + `provider_type`.
+async fn resolve_api_key_from_secrets(
+    state: &GatewayState,
+    user_id: &str,
+    api_key: &mut Option<String>,
+    provider_id: &Option<String>,
+    provider_type: &Option<String>,
+) {
+    // Already have a key from the request — nothing to resolve.
+    if api_key.as_ref().is_some_and(|k| !k.is_empty()) {
+        return;
+    }
+    let pid = match provider_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(id) => id,
+        None => return,
+    };
+    let secrets = match state.secrets_store.as_ref() {
+        Some(s) => s,
+        None => return,
+    };
+    let secret_name = match provider_type.as_deref() {
+        Some("custom") => format!("llm_custom_{}_api_key", pid),
+        _ => format!("llm_builtin_{}_api_key", pid),
+    };
+    if let Ok(decrypted) = secrets.get_decrypted(user_id, &secret_name).await {
+        *api_key = Some(decrypted.expose().to_string());
+    }
 }
 
 /// Check if a base URL belongs to a NEAR AI private endpoint by verifying the
@@ -2763,13 +2814,22 @@ fn interpret_chat_response(
                     message: format!("Authentication failed ({})", status),
                 }
             } else if status == reqwest::StatusCode::BAD_REQUEST
-                || status == reqwest::StatusCode::NOT_FOUND
                 || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
             {
-                // 400/404/422 = server reachable, likely wrong model name or endpoint variant — still a success for connectivity
+                // 400/422 = server reachable, likely wrong endpoint variant — connectivity OK
                 TestConnectionResponse {
                     ok: true,
                     message: format!("Server reachable ({})", status),
+                }
+            } else if status == reqwest::StatusCode::NOT_FOUND {
+                // 404 = /models endpoint not found — server reachable but not OpenAI-compatible
+                TestConnectionResponse {
+                    ok: false,
+                    message: format!(
+                        "Server reachable but /models endpoint not found ({}). \
+                         Check the base URL and adapter type.",
+                        status
+                    ),
                 }
             } else if status.is_client_error() {
                 TestConnectionResponse {
@@ -2796,6 +2856,10 @@ struct ListModelsRequest {
     base_url: String,
     #[serde(default)]
     api_key: Option<String>,
+    #[serde(default)]
+    provider_id: Option<String>,
+    #[serde(default)]
+    provider_type: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -2805,7 +2869,19 @@ struct ListModelsResponse {
     message: String,
 }
 
-async fn llm_list_models_handler(Json(body): Json<ListModelsRequest>) -> Json<ListModelsResponse> {
+async fn llm_list_models_handler(
+    State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+    Json(mut body): Json<ListModelsRequest>,
+) -> Json<ListModelsResponse> {
+    resolve_api_key_from_secrets(
+        &state,
+        &user.user_id,
+        &mut body.api_key,
+        &body.provider_id,
+        &body.provider_type,
+    )
+    .await;
     Json(fetch_provider_models(body).await)
 }
 
@@ -2944,7 +3020,13 @@ async fn fetch_provider_models(req: ListModelsRequest) -> ListModelsResponse {
 ///
 /// The frontend uses these as fallback values when the DB has no overrides.
 /// API keys are never returned — only a boolean `has_api_key`.
-async fn llm_env_defaults_handler() -> Json<serde_json::Value> {
+async fn llm_env_defaults_handler(
+    AuthenticatedUser(_user): AuthenticatedUser,
+) -> Json<serde_json::Value> {
+    Json(build_llm_env_defaults())
+}
+
+fn build_llm_env_defaults() -> serde_json::Value {
     use crate::config::helpers::optional_env;
     use crate::llm::registry::ProviderRegistry;
 
@@ -2995,7 +3077,7 @@ async fn llm_env_defaults_handler() -> Json<serde_json::Value> {
         defaults.insert(def.id.clone(), serde_json::Value::Object(entry));
     }
 
-    Json(serde_json::Value::Object(defaults))
+    serde_json::Value::Object(defaults)
 }
 
 // --- Gateway control plane handlers ---
@@ -3254,7 +3336,7 @@ mod tests {
             std::env::set_var("NEARAI_BASE_URL", "https://test.near.ai/v1");
         }
 
-        let Json(result) = llm_env_defaults_handler().await;
+        let result = build_llm_env_defaults();
         let map = result.as_object().expect("should be an object");
 
         // Check NEAR AI entry
@@ -3290,7 +3372,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_llm_env_defaults_includes_registry_providers() {
-        let Json(result) = llm_env_defaults_handler().await;
+        let result = build_llm_env_defaults();
         let map = result.as_object().expect("should be an object");
 
         // Registry providers should be present (openai, anthropic, ollama, etc.)

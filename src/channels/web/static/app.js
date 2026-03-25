@@ -6483,9 +6483,18 @@ document.getElementById('test-provider-btn').addEventListener('click', () => {
   result.style.display = 'none';
   result.className = 'test-connection-result';
 
+  // Resolve provider_id so the backend can look up vaulted API keys.
+  const providerId = _configuringBuiltinId || document.getElementById('provider-id').value.trim();
+
   apiFetch('/api/llm/test_connection', {
     method: 'POST',
-    body: { adapter, base_url: baseUrl, api_key: apiKey || undefined, model: model || undefined },
+    body: {
+      adapter, base_url: baseUrl,
+      api_key: apiKey || undefined,
+      model: model || undefined,
+      provider_id: providerId || undefined,
+      provider_type: _configuringBuiltinId ? 'builtin' : 'custom',
+    },
   })
     .then((data) => {
       result.textContent = data.message;
@@ -6680,9 +6689,17 @@ document.getElementById('fetch-models-btn').addEventListener('click', () => {
   btn.disabled = true;
   btn.textContent = I18n.t('config.fetchingModels');
 
+  // Resolve provider_id so the backend can look up vaulted API keys.
+  const providerId = _configuringBuiltinId || document.getElementById('provider-id').value.trim();
+
   apiFetch('/api/llm/list_models', {
     method: 'POST',
-    body: { adapter, base_url: baseUrl, api_key: apiKey || undefined },
+    body: {
+      adapter, base_url: baseUrl,
+      api_key: apiKey || undefined,
+      provider_id: providerId || undefined,
+      provider_type: _configuringBuiltinId ? 'builtin' : 'custom',
+    },
   })
     .then((data) => {
       const select = document.getElementById('provider-model-select');
