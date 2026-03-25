@@ -480,9 +480,13 @@ impl Channel for ReplChannel {
 
     async fn start(&self) -> Result<MessageStream, ChannelError> {
         let (tx, rx) = mpsc::channel(32);
-        // Store tx so send_status can inject approval responses directly
-        if let Ok(mut guard) = self.msg_tx.lock() {
-            *guard = Some(tx.clone());
+        // Interactive mode needs a sender handle so approval prompts can inject
+        // responses back into the channel. Single-message mode should not keep
+        // an extra sender alive or the receiver stream never closes.
+        if self.single_message.is_none() {
+            if let Ok(mut guard) = self.msg_tx.lock() {
+                *guard = Some(tx.clone());
+            }
         }
         let single_message = self.single_message.clone();
         let user_id = self.user_id.clone();
@@ -889,6 +893,7 @@ impl Channel for ReplChannel {
 #[cfg(test)]
 mod tests {
     use futures::StreamExt;
+    use tokio::time::{Duration, timeout};
 
     use super::*;
 
@@ -897,16 +902,25 @@ mod tests {
         let repl = ReplChannel::with_message("hi".to_string());
         let mut stream = repl.start().await.expect("repl start should succeed");
 
-        let first = stream.next().await.expect("first message missing");
+        let first = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("timed out waiting for first message")
+            .expect("first message missing");
         assert_eq!(first.channel, "repl");
         assert_eq!(first.content, "hi");
 
-        let second = stream.next().await.expect("quit message missing");
+        let second = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("timed out waiting for quit message")
+            .expect("quit message missing");
         assert_eq!(second.channel, "repl");
         assert_eq!(second.content, "/quit");
 
         assert!(
-            stream.next().await.is_none(),
+            timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("timed out waiting for stream to close")
+                .is_none(),
             "stream should end after /quit"
         );
     }
