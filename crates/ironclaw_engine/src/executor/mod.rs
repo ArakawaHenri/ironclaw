@@ -9,6 +9,7 @@ pub mod compaction;
 pub mod context;
 pub mod intent;
 pub mod loop_engine;
+pub mod orchestrator;
 pub mod prompt;
 pub mod scripting;
 pub mod structured;

@@ -859,7 +859,7 @@ fn extract_string_arg(
     args.get(position).map(monty_to_string)
 }
 
-fn monty_to_string(obj: &MontyObject) -> String {
+pub(crate) fn monty_to_string(obj: &MontyObject) -> String {
     match obj {
         MontyObject::String(s) => s.clone(),
         MontyObject::None => "None".into(),
@@ -983,7 +983,7 @@ async fn dispatch_action(
 
 // ── MontyObject ↔ JSON ──────────────────────────────────────
 
-fn monty_to_json(obj: &MontyObject) -> serde_json::Value {
+pub(crate) fn monty_to_json(obj: &MontyObject) -> serde_json::Value {
     match obj {
         MontyObject::None => serde_json::Value::Null,
         MontyObject::Bool(b) => serde_json::Value::Bool(*b),
@@ -1017,7 +1017,7 @@ fn monty_to_json(obj: &MontyObject) -> serde_json::Value {
     }
 }
 
-fn json_to_monty(val: &serde_json::Value) -> MontyObject {
+pub(crate) fn json_to_monty(val: &serde_json::Value) -> MontyObject {
     match val {
         serde_json::Value::Null => MontyObject::None,
         serde_json::Value::Bool(b) => MontyObject::Bool(*b),
