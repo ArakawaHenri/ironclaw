@@ -16,6 +16,7 @@ use crate::agent::context_monitor::ContextMonitor;
 use crate::agent::heartbeat::spawn_heartbeat;
 use crate::agent::routine_engine::{RoutineEngine, spawn_cron_ticker};
 use crate::agent::self_repair::{DefaultSelfRepair, RepairResult, SelfRepair};
+use crate::agent::session::ThreadState;
 use crate::agent::session_manager::SessionManager;
 use crate::agent::submission::{Submission, SubmissionParser, SubmissionResult};
 use crate::agent::{HeartbeatConfig as AgentHeartbeatConfig, Router, Scheduler, SchedulerDeps};
@@ -82,6 +83,15 @@ fn resolve_owner_scope_notification_user(
     owner_fallback: Option<&str>,
 ) -> Option<String> {
     trimmed_option(explicit_user).or_else(|| trimmed_option(owner_fallback))
+}
+
+fn is_single_message_repl(message: &IncomingMessage) -> bool {
+    message.channel == "repl"
+        && message
+            .metadata
+            .get("single_message_mode")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
 }
 
 async fn resolve_channel_notification_user(
@@ -1150,9 +1160,15 @@ impl Agent {
                     fired,
                     "Consumed inbound user message with matching event-triggered routine(s)"
                 );
-                return Ok(Some(String::new()));
+                return if is_single_message_repl(message) {
+                    Ok(None)
+                } else {
+                    Ok(Some(String::new()))
+                };
             }
         }
+
+        let session_for_empty_exit = Arc::clone(&session);
 
         // Process based on submission type
         let result = match submission {
@@ -1263,7 +1279,13 @@ impl Agent {
                         SubmissionResult::Error { message } => {
                             Ok(Some(format!("Error: {}", message)))
                         }
-                        _ => Ok(Some(String::new())),
+                        _ => {
+                            if is_single_message_repl(message) {
+                                Ok(None)
+                            } else {
+                                Ok(Some(String::new()))
+                            }
+                        }
                     };
                 }
                 // Authorization checks (including restart channel check) are enforced in handle_system_command
@@ -1325,7 +1347,26 @@ impl Agent {
                     Ok(Some(content))
                 }
             }
-            SubmissionResult::Ok { message } => Ok(message),
+            SubmissionResult::Ok {
+                message: output_message,
+            } => {
+                let should_exit =
+                    if output_message.as_deref() == Some("") && is_single_message_repl(message) {
+                        let sess = session_for_empty_exit.lock().await;
+                        sess.threads
+                            .get(&thread_id)
+                            .map(|thread| thread.state != ThreadState::AwaitingApproval)
+                            .unwrap_or(true)
+                    } else {
+                        false
+                    };
+
+                if should_exit {
+                    Ok(None)
+                } else {
+                    Ok(output_message)
+                }
+            }
             SubmissionResult::Error { message } => Ok(Some(format!("Error: {}", message))),
             SubmissionResult::Interrupted => Ok(Some("Interrupted.".into())),
             SubmissionResult::NeedApproval { .. } => {
@@ -1341,7 +1382,7 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::{
-        chat_tool_execution_metadata, resolve_routine_notification_user,
+        chat_tool_execution_metadata, is_single_message_repl, resolve_routine_notification_user,
         should_fallback_routine_notification, truncate_for_preview,
     };
     use crate::channels::IncomingMessage;
@@ -1502,5 +1543,18 @@ mod tests {
         };
 
         assert!(should_fallback_routine_notification(&error)); // safety: test-only assertion
+    }
+
+    #[test]
+    fn single_message_repl_detection_requires_repl_channel_and_metadata_flag() {
+        let repl = IncomingMessage::new("repl", "owner-scope", "hello")
+            .with_metadata(serde_json::json!({ "single_message_mode": true }));
+        let gateway = IncomingMessage::new("gateway", "owner-scope", "hello")
+            .with_metadata(serde_json::json!({ "single_message_mode": true }));
+        let plain_repl = IncomingMessage::new("repl", "owner-scope", "hello");
+
+        assert!(is_single_message_repl(&repl)); // safety: test-only assertion
+        assert!(!is_single_message_repl(&gateway)); // safety: test-only assertion
+        assert!(!is_single_message_repl(&plain_repl)); // safety: test-only assertion
     }
 }

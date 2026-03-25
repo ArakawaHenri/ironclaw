@@ -510,7 +510,9 @@ impl Channel for ReplChannel {
 
             // Single message mode: send it and return
             if let Some(msg) = single_message {
-                let incoming = IncomingMessage::new("repl", &user_id, &msg).with_timezone(&sys_tz);
+                let incoming = IncomingMessage::new("repl", &user_id, &msg)
+                    .with_metadata(serde_json::json!({ "single_message_mode": true }))
+                    .with_timezone(&sys_tz);
                 let _ = tx.blocking_send(incoming);
                 return;
             }
@@ -793,6 +795,7 @@ impl Channel for ReplChannel {
                 let msg_tx = Arc::clone(&self.msg_tx);
                 let user_id = self.user_id.clone();
                 let lock_flag = Arc::clone(&self.stdin_locked);
+                let single_message_mode = self.single_message.is_some();
                 tokio::task::spawn_blocking(move || {
                     let action = run_approval_selector(allow_always).unwrap_or("n");
                     // Unlock stdin so readline can resume after approval
@@ -801,7 +804,12 @@ impl Channel for ReplChannel {
                         return;
                     };
                     if let Some(tx) = guard.as_ref() {
-                        let msg = IncomingMessage::new("repl", &user_id, action);
+                        let msg = if single_message_mode {
+                            IncomingMessage::new("repl", &user_id, action)
+                                .with_metadata(serde_json::json!({ "single_message_mode": true }))
+                        } else {
+                            IncomingMessage::new("repl", &user_id, action)
+                        };
                         let _ = tx.blocking_send(msg);
                     }
                 });
