@@ -2218,7 +2218,7 @@ mod tests {
                 http_interceptor: None,
                 transcription: None,
                 document_extraction: None,
-                    builder: None,
+                builder: None,
                 llm_backend: "nearai".to_string(),
             };
 

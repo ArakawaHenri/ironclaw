@@ -975,10 +975,7 @@ impl FullJobWatcher {
     async fn build_job_summary(&self, status: RunStatus) -> String {
         // For failed jobs, try to get the failure reason first.
         if status == RunStatus::Failed
-            && let Ok(Some(reason)) = self
-                .store
-                .get_agent_job_failure_reason(self.job_id)
-                .await
+            && let Ok(Some(reason)) = self.store.get_agent_job_failure_reason(self.job_id).await
         {
             return format!("Job {} failed: {}", self.job_id, reason);
         }
@@ -1203,7 +1200,10 @@ fn format_tool_calls_for_transcript(
     }
     for tc in tool_calls {
         let args = serde_json::to_string_pretty(&tc.arguments).unwrap_or_else(|_| "{}".into());
-        parts.push(format!("**Tool call: {}**\n```json\n{}\n```", tc.name, args));
+        parts.push(format!(
+            "**Tool call: {}**\n```json\n{}\n```",
+            tc.name, args
+        ));
     }
     parts.join("\n\n")
 }
@@ -1522,7 +1522,11 @@ fn handle_text_response(
     // Check for the "nothing to do" sentinel (exact match on trimmed content).
     if content == "ROUTINE_OK" {
         let total_tokens = Some((total_input_tokens + total_output_tokens) as i32);
-        return Ok((RunStatus::Ok, Some("No issues found".to_string()), total_tokens));
+        return Ok((
+            RunStatus::Ok,
+            Some("No issues found".to_string()),
+            total_tokens,
+        ));
     }
 
     let total_tokens = Some((total_input_tokens + total_output_tokens) as i32);
