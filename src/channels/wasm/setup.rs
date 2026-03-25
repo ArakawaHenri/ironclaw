@@ -139,7 +139,11 @@ async fn register_channel(
     };
 
     let secret_header = loaded.webhook_secret_header().map(|s| s.to_string());
-    let host_webhook_secret = host_managed_webhook_secret(&channel_name, webhook_secret.clone());
+    let host_webhook_secret = if loaded.webhook_secret_managed_by_host() {
+        webhook_secret.clone()
+    } else {
+        None
+    };
 
     let webhook_path = format!("/webhook/{}", channel_name);
     let endpoints = vec![RegisteredEndpoint {
@@ -383,17 +387,6 @@ pub async fn inject_channel_credentials(
     }
 
     Ok(count)
-}
-
-fn host_managed_webhook_secret(
-    channel_name: &str,
-    webhook_secret: Option<String>,
-) -> Option<String> {
-    if channel_name == "feishu" {
-        None
-    } else {
-        webhook_secret
-    }
 }
 
 /// Inject channel-specific secrets into the config JSON.

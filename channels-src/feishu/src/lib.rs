@@ -33,6 +33,7 @@ wit_bindgen::generate!({
 });
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 // Re-export generated types
 use exports::near::agent::channel::{
@@ -104,6 +105,10 @@ struct FeishuEventHeader {
     /// Tenant key.
     #[serde(default)]
     tenant_key: Option<String>,
+
+    /// Verification token for v2 event payloads.
+    #[serde(default)]
+    token: Option<String>,
 }
 
 /// Message receive event payload (im.message.receive_v1).
@@ -305,11 +310,8 @@ impl Guest for FeishuChannel {
         if let Some(ref app_secret) = config.app_secret {
             let _ = channel_host::workspace_write(APP_SECRET_PATH, app_secret);
         }
-        if let Some(ref verification_token) = config.verification_token {
-            let _ = channel_host::workspace_write(VERIFICATION_TOKEN_PATH, verification_token);
-        } else {
-            let _ = channel_host::workspace_write(VERIFICATION_TOKEN_PATH, "");
-        }
+        let verification_token = config.verification_token.as_deref().unwrap_or("");
+        let _ = channel_host::workspace_write(VERIFICATION_TOKEN_PATH, verification_token);
 
         if let Some(owner_id) = &config.owner_id {
             let _ = channel_host::workspace_write(OWNER_ID_PATH, owner_id);
@@ -391,7 +393,7 @@ impl Guest for FeishuChannel {
         if !is_authenticated_webhook(
             req.secret_validated,
             configured_token.as_deref(),
-            event.token.as_deref(),
+            request_verification_token(&event),
         ) {
             channel_host::log(
                 channel_host::LogLevel::Warn,
@@ -876,9 +878,19 @@ fn is_authenticated_webhook(
     }
 
     match (configured_token, request_token) {
-        (Some(expected), Some(provided)) => expected == provided,
+        (Some(expected), Some(provided)) => {
+            bool::from(expected.as_bytes().ct_eq(provided.as_bytes()))
+        }
         _ => false,
     }
+}
+
+fn request_verification_token(event: &FeishuEvent) -> Option<&str> {
+    event
+        .header
+        .as_ref()
+        .and_then(|header| header.token.as_deref())
+        .or(event.token.as_deref())
 }
 
 #[cfg(test)]
@@ -966,5 +978,37 @@ mod tests {
             is_authenticated_webhook(true, Some("expected"), Some("wrong")),
             "host authentication should take precedence over body token checks"
         );
+    }
+
+    #[test]
+    fn request_verification_token_prefers_v2_header_token() {
+        let event: FeishuEvent = serde_json::from_str(
+            r#"{
+                "schema": "2.0",
+                "header": {
+                    "event_id": "evt_123",
+                    "event_type": "im.message.receive_v1",
+                    "token": "header-token"
+                },
+                "event": {}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(request_verification_token(&event), Some("header-token"));
+    }
+
+    #[test]
+    fn request_verification_token_falls_back_to_top_level_token() {
+        let event: FeishuEvent = serde_json::from_str(
+            r#"{
+                "type": "url_verification",
+                "challenge": "abc",
+                "token": "top-level-token"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(request_verification_token(&event), Some("top-level-token"));
     }
 }
