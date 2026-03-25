@@ -69,6 +69,11 @@ impl MultiAuthState {
     }
 
     /// Create a multi-user auth state from a map of tokens to identities.
+    ///
+    /// **Test-only** — production multi-user auth is DB-backed via
+    /// `DbAuthenticator`. This constructor is kept public (not `#[cfg(test)]`)
+    /// because integration tests in `tests/` compile the crate as a library
+    /// where `cfg(test)` is not set.
     pub fn multi(tokens: HashMap<String, UserIdentity>) -> Self {
         let hashed_tokens: Vec<([u8; 32], UserIdentity)> = tokens
             .into_iter()
@@ -188,7 +193,7 @@ impl DbAuthenticator {
 /// Combined auth state: tries env-var tokens first, then DB-backed tokens.
 #[derive(Clone)]
 pub struct CombinedAuthState {
-    /// In-memory tokens from GATEWAY_USER_TOKENS or GATEWAY_AUTH_TOKEN.
+    /// In-memory tokens from GATEWAY_AUTH_TOKEN.
     pub env_auth: MultiAuthState,
     /// DB-backed token authenticator (optional — only when a database is available).
     pub db_auth: Option<DbAuthenticator>,

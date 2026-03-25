@@ -26,9 +26,13 @@ fn row_to_user(row: &libsql::Row) -> Result<UserRecord, DatabaseError> {
     })
 }
 
-fn row_to_api_token(row: &libsql::Row) -> ApiTokenRecord {
-    ApiTokenRecord {
-        id: get_text(row, 0).parse().unwrap_or_default(),
+fn row_to_api_token(row: &libsql::Row) -> Result<ApiTokenRecord, DatabaseError> {
+    let id_str = get_text(row, 0);
+    let id: Uuid = id_str
+        .parse()
+        .map_err(|e| DatabaseError::Serialization(format!("invalid UUID: {e}")))?;
+    Ok(ApiTokenRecord {
+        id,
         user_id: get_text(row, 1),
         name: get_text(row, 2),
         token_prefix: get_text(row, 3),
@@ -36,12 +40,16 @@ fn row_to_api_token(row: &libsql::Row) -> ApiTokenRecord {
         last_used_at: get_opt_ts(row, 5),
         created_at: get_ts(row, 6),
         revoked_at: get_opt_ts(row, 7),
-    }
+    })
 }
 
-fn row_to_invitation(row: &libsql::Row) -> InvitationRecord {
-    InvitationRecord {
-        id: get_text(row, 0).parse().unwrap_or_default(),
+fn row_to_invitation(row: &libsql::Row) -> Result<InvitationRecord, DatabaseError> {
+    let id_str = get_text(row, 0);
+    let id: Uuid = id_str
+        .parse()
+        .map_err(|e| DatabaseError::Serialization(format!("invalid UUID: {e}")))?;
+    Ok(InvitationRecord {
+        id,
         email: get_opt_text(row, 1),
         invited_by: get_text(row, 2),
         status: get_text(row, 3),
@@ -49,7 +57,7 @@ fn row_to_invitation(row: &libsql::Row) -> InvitationRecord {
         accepted_at: get_opt_ts(row, 5),
         accepted_by: get_opt_text(row, 6),
         created_at: get_ts(row, 7),
-    }
+    })
 }
 
 #[async_trait]
@@ -274,7 +282,7 @@ impl UserStore for LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?
         {
-            tokens.push(row_to_api_token(&row));
+            tokens.push(row_to_api_token(&row)?);
         }
         Ok(tokens)
     }
@@ -328,8 +336,12 @@ impl UserStore for LibSqlBackend {
             .map_err(|e| DatabaseError::Query(e.to_string()))?
         {
             Some(row) => {
+                let id_str = get_text(&row, 0);
+                let token_id: Uuid = id_str
+                    .parse()
+                    .map_err(|e| DatabaseError::Serialization(format!("invalid UUID: {e}")))?;
                 let token = ApiTokenRecord {
-                    id: get_text(&row, 0).parse().unwrap_or_default(),
+                    id: token_id,
                     user_id: get_text(&row, 1),
                     name: get_text(&row, 2),
                     token_prefix: get_text(&row, 3),
@@ -410,7 +422,10 @@ impl UserStore for LibSqlBackend {
             .query(
                 r#"
                 SELECT id, email, invited_by, status, expires_at, accepted_at, accepted_by, created_at
-                FROM invitations WHERE invite_token_hash = ?1
+                FROM invitations
+                WHERE invite_token_hash = ?1
+                  AND status = 'pending'
+                  AND expires_at > strftime('%Y-%m-%dT%H:%M:%S', 'now')
                 "#,
                 params![libsql::Value::Blob(invite_hash.to_vec())],
             )
@@ -422,7 +437,7 @@ impl UserStore for LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?
         {
-            Some(row) => Ok(Some(row_to_invitation(&row))),
+            Some(row) => Ok(Some(row_to_invitation(&row)?)),
             None => Ok(None),
         }
     }
@@ -478,7 +493,7 @@ impl UserStore for LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?
         {
-            invitations.push(row_to_invitation(&row));
+            invitations.push(row_to_invitation(&row)?);
         }
         Ok(invitations)
     }
@@ -727,14 +742,21 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify accepted
-        let accepted = db
-            .get_invitation_by_hash(&invite_hash)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(accepted.status, "accepted");
-        assert_eq!(accepted.accepted_by, Some("newuser".to_string()));
+        // After acceptance, the invitation should no longer be found via hash
+        // lookup (which filters for status='pending')
+        assert!(
+            db.get_invitation_by_hash(&invite_hash)
+                .await
+                .unwrap()
+                .is_none(),
+            "Accepted invitation should not be returned by pending-only lookup"
+        );
+
+        // Verify via list that it was accepted
+        let all = db.list_invitations(Some("alice")).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].status, "accepted");
+        assert_eq!(all[0].accepted_by, Some("newuser".to_string()));
     }
 
     #[tokio::test]

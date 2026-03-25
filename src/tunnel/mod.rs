@@ -431,7 +431,6 @@ mod tests {
             user_id: "test".to_string(),
             workspace_read_scopes: Vec::new(),
             memory_layers: Vec::new(),
-            user_tokens: None,
         });
         c
     }
@@ -445,7 +444,6 @@ mod tests {
             user_id: "test".to_string(),
             workspace_read_scopes: Vec::new(),
             memory_layers: Vec::new(),
-            user_tokens: None,
         });
         c
     }

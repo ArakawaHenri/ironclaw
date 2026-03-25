@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::config::helpers::{optional_env, parse_bool_env, parse_option_env, parse_optional_env};
+use crate::config::helpers::{parse_bool_env, parse_option_env, parse_optional_env};
 use crate::error::ConfigError;
 use crate::settings::Settings;
 
@@ -34,7 +34,8 @@ pub struct AgentConfig {
     /// Maximum tokens per job (0 = unlimited).
     pub max_tokens_per_job: u64,
     /// Whether the deployment is multi-tenant (multiple users sharing one
-    /// instance). Auto-detected from GATEWAY_USER_TOKENS presence.
+    /// instance). Detected at runtime after DB initialization, not from config.
+    /// See app.rs startup logic.
     pub multi_tenant: bool,
 }
 
@@ -120,9 +121,9 @@ impl AgentConfig {
                 "AGENT_MAX_TOKENS_PER_JOB",
                 settings.agent.max_tokens_per_job,
             )?,
-            // Auto-detected from GATEWAY_USER_TOKENS presence. Not a separate
-            // knob — multi-tenant mode is always implied by configuring user tokens.
-            multi_tenant: optional_env("GATEWAY_USER_TOKENS")?.is_some(),
+            // Multi-tenant mode is detected at runtime after DB initialization,
+            // not from config. See app.rs startup logic.
+            multi_tenant: false,
         })
     }
 }

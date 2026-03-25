@@ -1,13 +1,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use secrecy::SecretString;
-use serde::Deserialize;
-
 use crate::bootstrap::ironclaw_base_dir;
 use crate::config::helpers::{optional_env, parse_bool_env, parse_optional_env};
 use crate::error::ConfigError;
 use crate::settings::Settings;
+use secrecy::SecretString;
 
 /// Channel configurations.
 #[derive(Debug, Clone)]
@@ -54,18 +52,6 @@ pub struct GatewayConfig {
     pub workspace_read_scopes: Vec<String>,
     /// Memory layer definitions (JSON in env var, or from external config).
     pub memory_layers: Vec<crate::workspace::layer::MemoryLayer>,
-    /// Multi-user token map. When set, each token maps to a user identity.
-    /// Parsed from `GATEWAY_USER_TOKENS` (JSON string). When absent, falls back
-    /// to single-user mode via `auth_token` + `user_id`.
-    pub user_tokens: Option<HashMap<String, UserTokenConfig>>,
-}
-
-/// Per-user token configuration for multi-user mode.
-#[derive(Debug, Clone, Deserialize)]
-pub struct UserTokenConfig {
-    pub user_id: String,
-    #[serde(default)]
-    pub workspace_read_scopes: Vec<String>,
 }
 
 /// Signal channel configuration (signal-cli daemon HTTP/JSON-RPC).
@@ -196,41 +182,6 @@ impl ChannelsConfig {
                 }
             }
 
-            let user_tokens: Option<HashMap<String, UserTokenConfig>> =
-                match optional_env("GATEWAY_USER_TOKENS")? {
-                    Some(json_str) => {
-                        let tokens: HashMap<String, UserTokenConfig> = serde_json::from_str(
-                            &json_str,
-                        )
-                        .map_err(|e| ConfigError::InvalidValue {
-                            key: "GATEWAY_USER_TOKENS".to_string(),
-                            message: format!(
-                                "must be valid JSON object mapping tokens to user configs: {e}"
-                            ),
-                        })?;
-                        if tokens.is_empty() {
-                            return Err(ConfigError::InvalidValue {
-                            key: "GATEWAY_USER_TOKENS".to_string(),
-                            message:
-                                "token map is empty — remove the variable to use single-user mode"
-                                    .to_string(),
-                        });
-                        }
-                        for (tok, cfg) in &tokens {
-                            if cfg.user_id.trim().is_empty() {
-                                return Err(ConfigError::InvalidValue {
-                                    key: "GATEWAY_USER_TOKENS".to_string(),
-                                    message: format!(
-                                        "token '{}...' has an empty user_id",
-                                        &tok[..tok.len().min(8)]
-                                    ),
-                                });
-                            }
-                        }
-                        Some(tokens)
-                    }
-                    None => None,
-                };
             let workspace_read_scopes: Vec<String> = optional_env("WORKSPACE_READ_SCOPES")?
                 .map(|s| {
                     s.split(',')
@@ -261,7 +212,6 @@ impl ChannelsConfig {
                 user_id,
                 workspace_read_scopes,
                 memory_layers,
-                user_tokens,
             })
         } else {
             None
@@ -419,7 +369,6 @@ mod tests {
             user_id: "default".to_string(),
             workspace_read_scopes: vec![],
             memory_layers: vec![],
-            user_tokens: None,
         };
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 3000);
@@ -436,7 +385,6 @@ mod tests {
             user_id: "anon".to_string(),
             workspace_read_scopes: vec![],
             memory_layers: vec![],
-            user_tokens: None,
         };
         assert!(cfg.auth_token.is_none());
     }

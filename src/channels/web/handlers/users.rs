@@ -7,6 +7,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
 };
+use uuid::Uuid;
 
 use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::server::GatewayState;
@@ -34,16 +35,7 @@ pub async fn users_create_handler(
 
     let email = body.get("email").and_then(|v| v.as_str()).map(String::from);
 
-    // Generate user id: prefer email if provided, otherwise derive from display_name.
-    let user_id = if let Some(ref e) = email {
-        e.clone()
-    } else {
-        display_name
-            .to_ascii_lowercase()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join("-")
-    };
+    let user_id = Uuid::new_v4().to_string();
 
     let now = chrono::Utc::now();
     let user_record = UserRecord {

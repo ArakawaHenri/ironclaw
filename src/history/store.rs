@@ -2314,7 +2314,7 @@ impl Store {
     pub async fn get_user(&self, id: &str) -> Result<Option<UserRecord>, DatabaseError> {
         let conn = self.conn().await?;
         let row = conn
-            .query_opt("SELECT * FROM users WHERE id = $1", &[&id])
+            .query_opt("SELECT id, email, display_name, status, created_at, updated_at, last_login_at, created_by, metadata FROM users WHERE id = $1", &[&id])
             .await?;
         Ok(row.map(|r| row_to_user(&r)))
     }
@@ -2326,7 +2326,7 @@ impl Store {
     ) -> Result<Option<UserRecord>, DatabaseError> {
         let conn = self.conn().await?;
         let row = conn
-            .query_opt("SELECT * FROM users WHERE email = $1", &[&email])
+            .query_opt("SELECT id, email, display_name, status, created_at, updated_at, last_login_at, created_by, metadata FROM users WHERE email = $1", &[&email])
             .await?;
         Ok(row.map(|r| row_to_user(&r)))
     }
@@ -2337,13 +2337,13 @@ impl Store {
         let rows = match status {
             Some(s) => {
                 conn.query(
-                    "SELECT * FROM users WHERE status = $1 ORDER BY created_at",
+                    "SELECT id, email, display_name, status, created_at, updated_at, last_login_at, created_by, metadata FROM users WHERE status = $1 ORDER BY created_at DESC",
                     &[&s],
                 )
                 .await?
             }
             None => {
-                conn.query("SELECT * FROM users ORDER BY created_at", &[])
+                conn.query("SELECT id, email, display_name, status, created_at, updated_at, last_login_at, created_by, metadata FROM users ORDER BY created_at DESC", &[])
                     .await?
             }
         };

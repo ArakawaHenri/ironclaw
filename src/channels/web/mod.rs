@@ -124,49 +124,6 @@ impl GatewayChannel {
         }
     }
 
-    /// Create a gateway channel with a pre-built multi-user auth state.
-    pub fn new_multi_auth(config: GatewayConfig, auth: MultiAuthState) -> Self {
-        let auth = CombinedAuthState {
-            env_auth: auth,
-            db_auth: None,
-        };
-        let state = Arc::new(GatewayState {
-            msg_tx: tokio::sync::RwLock::new(None),
-            sse: Arc::new(SseManager::new()),
-            workspace: None,
-            workspace_pool: None,
-            session_manager: None,
-            log_broadcaster: None,
-            log_level_handle: None,
-            extension_manager: None,
-            tool_registry: None,
-            store: None,
-            job_manager: None,
-            prompt_queue: None,
-            scheduler: None,
-            default_user_id: config.user_id.clone(),
-            shutdown_tx: tokio::sync::RwLock::new(None),
-            ws_tracker: Some(Arc::new(ws::WsConnectionTracker::new())),
-            llm_provider: None,
-            skill_registry: None,
-            skill_catalog: None,
-            chat_rate_limiter: server::PerUserRateLimiter::new(30, 60),
-            oauth_rate_limiter: server::RateLimiter::new(10, 60),
-            registry_entries: Vec::new(),
-            cost_guard: None,
-            routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
-            startup_time: std::time::Instant::now(),
-            webhook_rate_limiter: server::RateLimiter::new(10, 60),
-            active_config: server::ActiveConfigSnapshot::default(),
-        });
-
-        Self {
-            config,
-            state,
-            auth,
-        }
-    }
-
     /// Helper to rebuild state, copying existing fields and applying a mutation.
     fn rebuild_state(&mut self, mutate: impl FnOnce(&mut GatewayState)) {
         let mut new_state = GatewayState {

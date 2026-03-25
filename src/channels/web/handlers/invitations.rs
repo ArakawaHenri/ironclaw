@@ -162,12 +162,7 @@ pub async fn invitations_accept_handler(
         return Err((StatusCode::GONE, "Invitation has expired".to_string()));
     }
 
-    // Generate a user id from the display name.
-    let new_user_id = display_name
-        .to_ascii_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join("-");
+    let new_user_id = Uuid::new_v4().to_string();
 
     let now = chrono::Utc::now();
     let user_record = UserRecord {
