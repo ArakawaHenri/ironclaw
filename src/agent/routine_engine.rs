@@ -45,17 +45,6 @@ enum EventMatcher {
     System { routine: Routine },
 }
 
-/// Distinguishes why sandbox is unavailable so error messages are accurate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SandboxReadiness {
-    /// Docker is available and sandbox is enabled.
-    Available,
-    /// User explicitly disabled sandboxing (SANDBOX_ENABLED=false).
-    DisabledByConfig,
-    /// Sandbox is enabled but Docker is not running or not installed.
-    DockerUnavailable,
-}
-
 /// Check whether an event-triggered routine's user/channel filters match an
 /// incoming message.
 ///
@@ -110,8 +99,6 @@ pub struct RoutineEngine {
     tools: Arc<ToolRegistry>,
     /// Safety layer for tool output sanitization.
     safety: Arc<SafetyLayer>,
-    /// Sandbox readiness state for full-job dispatch.
-    sandbox_readiness: SandboxReadiness,
     /// Timestamp when this engine instance was created. Used by
     /// `sync_dispatched_runs` to distinguish orphaned runs (from a previous
     /// process) from actively-watched runs (from this process).
@@ -130,7 +117,6 @@ impl RoutineEngine {
         extension_manager: Option<Arc<ExtensionManager>>,
         tools: Arc<ToolRegistry>,
         safety: Arc<SafetyLayer>,
-        sandbox_readiness: SandboxReadiness,
     ) -> Self {
         Self {
             config,
@@ -144,7 +130,6 @@ impl RoutineEngine {
             extension_manager,
             tools,
             safety,
-            sandbox_readiness,
             boot_time: Utc::now(),
         }
     }
@@ -749,7 +734,6 @@ impl RoutineEngine {
             extension_manager: self.extension_manager.clone(),
             tools: self.tools.clone(),
             safety: self.safety.clone(),
-            sandbox_readiness: self.sandbox_readiness,
         };
 
         tokio::spawn(async move {
@@ -834,7 +818,6 @@ impl RoutineEngine {
             extension_manager: self.extension_manager.clone(),
             tools: self.tools.clone(),
             safety: self.safety.clone(),
-            sandbox_readiness: self.sandbox_readiness,
         };
 
         tokio::spawn(async move {
@@ -871,7 +854,6 @@ impl RoutineEngine {
             extension_manager: self.extension_manager.clone(),
             tools: self.tools.clone(),
             safety: self.safety.clone(),
-            sandbox_readiness: self.sandbox_readiness,
         };
 
         // Record the run in DB, then spawn execution
@@ -984,8 +966,49 @@ impl FullJobWatcher {
             tokio::time::sleep(Self::POLL_INTERVAL).await;
         };
 
-        let summary = format!("Job {} finished ({})", self.job_id, final_status);
+        // Build a meaningful summary from the job's actual output.
+        let summary = self.build_job_summary(final_status).await;
         (final_status, Some(summary))
+    }
+
+    /// Build a summary from the job's failure reason or last action output.
+    async fn build_job_summary(&self, status: RunStatus) -> String {
+        // For failed jobs, try to get the failure reason first.
+        if status == RunStatus::Failed
+            && let Ok(Some(reason)) = self
+                .store
+                .get_agent_job_failure_reason(self.job_id)
+                .await
+        {
+            return format!("Job {} failed: {}", self.job_id, reason);
+        }
+
+        // Try to get the last action output as a summary.
+        if let Ok(actions) = self.store.get_job_actions(self.job_id).await
+            && let Some(last) = actions.last()
+        {
+            let output = last
+                .output_sanitized
+                .as_ref()
+                .map(|v| v.to_string())
+                .or_else(|| last.output_raw.clone())
+                .unwrap_or_default();
+            if !output.is_empty() {
+                // Truncate to a reasonable summary length.
+                const MAX_SUMMARY: usize = 1024;
+                let truncated = if output.len() > MAX_SUMMARY {
+                    &output[..output.floor_char_boundary(MAX_SUMMARY)]
+                } else {
+                    &output
+                };
+                return format!(
+                    "Job {} {} (last tool: {}): {}",
+                    self.job_id, status, last.tool_name, truncated
+                );
+            }
+        }
+
+        format!("Job {} finished ({})", self.job_id, status)
     }
 
     fn map_job_state(state: &crate::context::JobState) -> RunStatus {
@@ -1009,13 +1032,34 @@ struct EngineContext {
     extension_manager: Option<Arc<ExtensionManager>>,
     tools: Arc<ToolRegistry>,
     safety: Arc<SafetyLayer>,
-    sandbox_readiness: SandboxReadiness,
 }
 
 /// Execute a routine run. Handles both lightweight and full_job modes.
 async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) {
     // Increment running count (atomic: survives panics in the execution below)
     ctx.running_count.fetch_add(1, Ordering::Relaxed);
+
+    // Resolve the routine's conversation thread BEFORE execution so we can
+    // persist the full LLM transcript (not just a summary) as it happens.
+    let conv_id = match ctx
+        .store
+        .get_or_create_routine_conversation(routine.id, &routine.name, &routine.user_id)
+        .await
+    {
+        Ok(id) => {
+            tracing::debug!(
+                routine = %routine.name,
+                routine_id = %routine.id,
+                conversation_id = %id,
+                "Resolved routine conversation thread"
+            );
+            Some(id)
+        }
+        Err(e) => {
+            tracing::error!(routine = %routine.name, "Failed to get routine conversation: {}", e);
+            None
+        }
+    };
 
     let result = match &routine.action {
         RoutineAction::Lightweight {
@@ -1033,6 +1077,7 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
                 *max_tokens,
                 *use_tools,
                 *max_tool_rounds,
+                conv_id,
             )
             .await
         }
@@ -1104,38 +1149,7 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
         tracing::error!(routine = %routine.name, "Failed to update runtime state: {}", e);
     }
 
-    // Persist routine result to its dedicated conversation thread
-    let thread_id = match ctx
-        .store
-        .get_or_create_routine_conversation(routine.id, &routine.name, &routine.user_id)
-        .await
-    {
-        Ok(conv_id) => {
-            tracing::debug!(
-                routine = %routine.name,
-                routine_id = %routine.id,
-                conversation_id = %conv_id,
-                "Resolved routine conversation thread"
-            );
-            // Record the run result as a conversation message
-            let msg = match (&summary, status) {
-                (Some(s), _) => format!("[{}] {}: {}", run.trigger_type, status, s),
-                (None, _) => format!("[{}] {}", run.trigger_type, status),
-            };
-            if let Err(e) = ctx
-                .store
-                .add_conversation_message(conv_id, "assistant", &msg)
-                .await
-            {
-                tracing::error!(routine = %routine.name, "Failed to persist routine message: {}", e);
-            }
-            Some(conv_id.to_string())
-        }
-        Err(e) => {
-            tracing::error!(routine = %routine.name, "Failed to get routine conversation: {}", e);
-            None
-        }
-    };
+    let thread_id = conv_id.map(|id| id.to_string());
 
     // Send notifications based on config
     send_notification(
@@ -1164,6 +1178,36 @@ fn sanitize_routine_name(name: &str) -> String {
         .collect()
 }
 
+/// Persist a single message to a routine conversation thread.
+/// Errors are logged but not propagated — transcript persistence is best-effort.
+async fn persist_conv_msg(store: &Arc<dyn Database>, conv_id: Uuid, role: &str, content: &str) {
+    if let Err(e) = store.add_conversation_message(conv_id, role, content).await {
+        tracing::warn!(
+            conversation_id = %conv_id,
+            "Failed to persist routine transcript message: {}", e
+        );
+    }
+}
+
+/// Format tool calls from an LLM response into a human-readable transcript entry.
+fn format_tool_calls_for_transcript(
+    text: Option<&str>,
+    tool_calls: &[crate::llm::ToolCall],
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(t) = text {
+        let t = t.trim();
+        if !t.is_empty() {
+            parts.push(t.to_string());
+        }
+    }
+    for tc in tool_calls {
+        let args = serde_json::to_string_pretty(&tc.arguments).unwrap_or_else(|_| "{}".into());
+        parts.push(format!("**Tool call: {}**\n```json\n{}\n```", tc.name, args));
+    }
+    parts.join("\n\n")
+}
+
 /// Execute a full-job routine by dispatching to the scheduler.
 ///
 /// Fire-and-forget: creates a job via `Scheduler::dispatch_job` (which handles
@@ -1184,24 +1228,6 @@ async fn execute_full_job(
     run: &RoutineRun,
     execution: &FullJobExecutionConfig<'_>,
 ) -> Result<(RunStatus, Option<String>, Option<i32>), RoutineError> {
-    match ctx.sandbox_readiness {
-        SandboxReadiness::Available => {}
-        SandboxReadiness::DisabledByConfig => {
-            return Err(RoutineError::JobDispatchFailed {
-                reason: "Sandboxing is disabled (SANDBOX_ENABLED=false). \
-                         Full-job routines require sandbox."
-                    .to_string(),
-            });
-        }
-        SandboxReadiness::DockerUnavailable => {
-            return Err(RoutineError::JobDispatchFailed {
-                reason: "Sandbox is enabled but Docker is not available. \
-                         Install Docker or set SANDBOX_ENABLED=false."
-                    .to_string(),
-            });
-        }
-    }
-
     let scheduler = ctx
         .scheduler
         .as_ref()
@@ -1262,6 +1288,10 @@ async fn execute_full_job(
 ///
 /// If tools are enabled, this runs a simplified agentic loop (max 3-5 iterations).
 /// If tools are disabled, this does a single LLM call (original behavior).
+///
+/// When `conv_id` is provided, the full LLM transcript (prompt, responses,
+/// tool calls, tool results) is persisted to the conversation thread.
+#[allow(clippy::too_many_arguments)]
 async fn execute_lightweight(
     ctx: &EngineContext,
     routine: &Routine,
@@ -1270,6 +1300,7 @@ async fn execute_lightweight(
     max_tokens: u32,
     use_tools: bool,
     max_tool_rounds: u32,
+    conv_id: Option<Uuid>,
 ) -> Result<(RunStatus, Option<String>, Option<i32>), RoutineError> {
     // Load context from workspace
     let mut context_parts = Vec::new();
@@ -1330,6 +1361,7 @@ async fn execute_lightweight(
             &full_prompt,
             effective_max_tokens,
             max_tool_rounds,
+            conv_id,
         )
         .await
     } else {
@@ -1339,6 +1371,7 @@ async fn execute_lightweight(
             &system_prompt,
             &full_prompt,
             effective_max_tokens,
+            conv_id,
         )
         .await
     }
@@ -1425,7 +1458,13 @@ async fn execute_lightweight_no_tools(
     system_prompt: &str,
     full_prompt: &str,
     effective_max_tokens: u32,
+    conv_id: Option<Uuid>,
 ) -> Result<(RunStatus, Option<String>, Option<i32>), RoutineError> {
+    // Persist the prompt to the conversation thread.
+    if let Some(cid) = conv_id {
+        persist_conv_msg(&ctx.store, cid, "user", full_prompt).await;
+    }
+
     let messages = if system_prompt.is_empty() {
         vec![ChatMessage::user(full_prompt)]
     } else {
@@ -1446,6 +1485,11 @@ async fn execute_lightweight_no_tools(
         .map_err(|e| RoutineError::LlmFailed {
             reason: e.to_string(),
         })?;
+
+    // Persist the LLM response to the conversation thread.
+    if let Some(cid) = conv_id {
+        persist_conv_msg(&ctx.store, cid, "assistant", &response.content).await;
+    }
 
     handle_text_response(
         &response.content,
@@ -1478,7 +1522,7 @@ fn handle_text_response(
     // Check for the "nothing to do" sentinel (exact match on trimmed content).
     if content == "ROUTINE_OK" {
         let total_tokens = Some((total_input_tokens + total_output_tokens) as i32);
-        return Ok((RunStatus::Ok, None, total_tokens));
+        return Ok((RunStatus::Ok, Some("No issues found".to_string()), total_tokens));
     }
 
     let total_tokens = Some((total_input_tokens + total_output_tokens) as i32);
@@ -1497,6 +1541,8 @@ fn handle_text_response(
 /// - Uses the owner's live autonomous tool scope when lightweight tools are enabled
 /// - Auto-approval of non-Always tools
 /// - No hooks or approval dialogs
+///
+/// When `conv_id` is provided, the full transcript is persisted to the conversation thread.
 async fn execute_lightweight_with_tools(
     ctx: &EngineContext,
     routine: &Routine,
@@ -1504,6 +1550,7 @@ async fn execute_lightweight_with_tools(
     full_prompt: &str,
     effective_max_tokens: u32,
     max_tool_rounds: u32,
+    conv_id: Option<Uuid>,
 ) -> Result<(RunStatus, Option<String>, Option<i32>), RoutineError> {
     let mut messages = if system_prompt.is_empty() {
         vec![ChatMessage::user(full_prompt)]
@@ -1513,6 +1560,11 @@ async fn execute_lightweight_with_tools(
             ChatMessage::user(full_prompt),
         ]
     };
+
+    // Persist the prompt to the conversation thread.
+    if let Some(cid) = conv_id {
+        persist_conv_msg(&ctx.store, cid, "user", full_prompt).await;
+    }
 
     let max_iterations = max_tool_rounds
         .min(ctx.config.lightweight_max_iterations)
@@ -1557,6 +1609,11 @@ async fn execute_lightweight_with_tools(
             total_input_tokens += response.input_tokens;
             total_output_tokens += response.output_tokens;
 
+            // Persist final text response.
+            if let Some(cid) = conv_id {
+                persist_conv_msg(&ctx.store, cid, "assistant", &response.content).await;
+            }
+
             return handle_text_response(
                 &response.content,
                 response.finish_reason,
@@ -1590,6 +1647,12 @@ async fn execute_lightweight_with_tools(
             // Check if LLM returned text (no tool calls)
             if response.tool_calls.is_empty() {
                 let content = response.content.unwrap_or_default();
+
+                // Persist final text response.
+                if let Some(cid) = conv_id {
+                    persist_conv_msg(&ctx.store, cid, "assistant", &content).await;
+                }
+
                 return handle_text_response(
                     &content,
                     response.finish_reason,
@@ -1603,6 +1666,15 @@ async fn execute_lightweight_with_tools(
                 response.content.clone(),
                 response.tool_calls.clone(),
             ));
+
+            // Persist the assistant message with tool calls to the conversation.
+            if let Some(cid) = conv_id {
+                let tool_call_text = format_tool_calls_for_transcript(
+                    response.content.as_deref(),
+                    &response.tool_calls,
+                );
+                persist_conv_msg(&ctx.store, cid, "assistant", &tool_call_text).await;
+            }
 
             // Execute tools sequentially
             for tc in response.tool_calls {
@@ -1632,6 +1704,12 @@ async fn execute_lightweight_with_tools(
                 } else {
                     result_content
                 };
+
+                // Persist tool result to conversation.
+                if let Some(cid) = conv_id {
+                    let tool_msg = format!("**Tool: {}**\n{}", tc.name, result_content);
+                    persist_conv_msg(&ctx.store, cid, "tool", &tool_msg).await;
+                }
 
                 // Add tool result to context
                 messages.push(ChatMessage::tool_result(&tc.id, &tc.name, &result_content));
@@ -2322,40 +2400,6 @@ mod tests {
         assert_eq!(RunStatus::Running.to_string(), "running");
     }
 
-    #[test]
-    fn test_sandbox_readiness_disabled_by_config_error() {
-        use super::SandboxReadiness;
-
-        let readiness = SandboxReadiness::DisabledByConfig;
-        assert_ne!(readiness, SandboxReadiness::Available);
-
-        let err = crate::error::RoutineError::JobDispatchFailed {
-            reason: "Sandboxing is disabled (SANDBOX_ENABLED=false). \
-                     Full-job routines require sandbox."
-                .to_string(),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("SANDBOX_ENABLED=false"));
-        assert!(msg.contains("require sandbox"));
-    }
-
-    #[test]
-    fn test_sandbox_readiness_docker_unavailable_error() {
-        use super::SandboxReadiness;
-
-        let readiness = SandboxReadiness::DockerUnavailable;
-        assert_ne!(readiness, SandboxReadiness::Available);
-
-        let err = crate::error::RoutineError::JobDispatchFailed {
-            reason: "Sandbox is enabled but Docker is not available. \
-                     Install Docker or set SANDBOX_ENABLED=false."
-                .to_string(),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("Docker is not available"));
-        assert!(msg.contains("SANDBOX_ENABLED"));
-    }
-
     /// Regression test for #1317: FullJobWatcher maps terminal job states correctly.
     #[test]
     fn test_full_job_watcher_state_mapping() {
@@ -2482,5 +2526,80 @@ mod tests {
         let result = sanitize_summary(&s);
         assert!(result.len() <= 503);
         assert!(result.ends_with("..."));
+    }
+
+    /// Regression test: ROUTINE_OK sentinel must produce a non-None result_summary
+    /// so that routine_history always has meaningful output for the user.
+    #[test]
+    fn test_handle_text_response_routine_ok_has_summary() {
+        use crate::llm::FinishReason;
+
+        let result = super::handle_text_response("ROUTINE_OK", FinishReason::Stop, 100, 10);
+        let (status, summary, tokens) = result.expect("should succeed");
+        assert_eq!(status, RunStatus::Ok);
+        assert_eq!(
+            summary.as_deref(),
+            Some("No issues found"),
+            "ROUTINE_OK should produce a human-readable summary, not None"
+        );
+        assert_eq!(tokens, Some(110));
+    }
+
+    /// Regression test: non-sentinel text responses must preserve the full content
+    /// as the result_summary so it's visible in routine_history.
+    #[test]
+    fn test_handle_text_response_attention_preserves_content() {
+        use crate::llm::FinishReason;
+
+        let content = "Disk usage at 92%, consider cleanup";
+        let result = super::handle_text_response(content, FinishReason::Stop, 200, 50);
+        let (status, summary, _) = result.expect("should succeed");
+        assert_eq!(status, RunStatus::Attention);
+        assert_eq!(
+            summary.as_deref(),
+            Some(content),
+            "Attention result must preserve the full LLM response as summary"
+        );
+    }
+
+    /// Regression test: tool calls are formatted as readable transcript entries
+    /// for the routine conversation thread.
+    #[test]
+    fn test_format_tool_calls_for_transcript() {
+        use crate::llm::ToolCall;
+
+        let tool_calls = vec![ToolCall {
+            id: "tc1".to_string(),
+            name: "memory_search".to_string(),
+            arguments: serde_json::json!({"query": "recent events"}),
+        }];
+
+        // With text content
+        let result = super::format_tool_calls_for_transcript(Some("Looking it up..."), &tool_calls);
+        assert!(result.contains("Looking it up..."));
+        assert!(result.contains("**Tool call: memory_search**"));
+        assert!(result.contains("recent events"));
+
+        // Without text content
+        let result = super::format_tool_calls_for_transcript(None, &tool_calls);
+        assert!(!result.contains("Looking"));
+        assert!(result.contains("**Tool call: memory_search**"));
+
+        // Multiple tool calls
+        let multi = vec![
+            ToolCall {
+                id: "tc1".to_string(),
+                name: "shell".to_string(),
+                arguments: serde_json::json!({"command": "ls"}),
+            },
+            ToolCall {
+                id: "tc2".to_string(),
+                name: "http".to_string(),
+                arguments: serde_json::json!({"url": "https://example.com"}),
+            },
+        ];
+        let result = super::format_tool_calls_for_transcript(None, &multi);
+        assert!(result.contains("**Tool call: shell**"));
+        assert!(result.contains("**Tool call: http**"));
     }
 }
