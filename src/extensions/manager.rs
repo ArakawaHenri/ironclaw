@@ -1335,11 +1335,17 @@ impl ExtensionManager {
                             Vec::new()
                         };
 
-                        let display_name = self
-                            .registry
-                            .get_with_kind(&server.name, Some(ExtensionKind::McpServer))
-                            .await
-                            .map(|e| e.display_name);
+                        let display_name =
+                            if crate::tools::mcp::config::is_nearai_companion_server_name(
+                                &server.name,
+                            ) {
+                                Some("NEAR AI Companion".to_string())
+                            } else {
+                                self.registry
+                                    .get_with_kind(&server.name, Some(ExtensionKind::McpServer))
+                                    .await
+                                    .map(|e| e.display_name)
+                            };
                         extensions.push(InstalledExtension {
                             name: server.name.clone(),
                             kind: ExtensionKind::McpServer,

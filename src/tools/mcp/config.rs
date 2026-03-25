@@ -357,9 +357,7 @@ pub fn derive_nearai_companion_mcp_server_from_llm(
     Some(
         McpServerConfig::new(NEARAI_COMPANION_MCP_NAME, format!("{mcp_base}/mcp"))
             .with_auth_source(McpAuthSource::NearAi)
-            .with_description(
-                "Companion chat-api MCP server derived from the active NEAR AI provider",
-            ),
+            .with_description("Companion MCP server derived from the active NEAR AI provider"),
     )
 }
 
