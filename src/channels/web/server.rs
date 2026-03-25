@@ -3096,29 +3096,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_extensions_setup_returns_interactive_login_for_weixin() {
+    async fn test_extensions_setup_returns_interactive_login_for_wechat() {
         use axum::body::Body;
         use tower::ServiceExt;
 
         let secrets = test_secrets_store();
         let (ext_mgr, _wasm_tools_dir, wasm_channels_dir) = test_ext_mgr(secrets);
 
-        std::fs::write(wasm_channels_dir.path().join("weixin.wasm"), b"\0asm fake")
-            .expect("write fake weixin wasm");
+        std::fs::write(wasm_channels_dir.path().join("wechat.wasm"), b"\0asm fake")
+            .expect("write fake wechat wasm");
         let caps = serde_json::json!({
             "type": "channel",
-            "name": "weixin",
+            "name": "wechat",
             "setup": {
                 "required_secrets": [
-                    {"name": "weixin_bot_token", "prompt": "Connect Weixin"}
+                    {"name": "wechat_bot_token", "prompt": "Connect WeChat"}
                 ]
             }
         });
         std::fs::write(
-            wasm_channels_dir.path().join("weixin.capabilities.json"),
-            serde_json::to_string(&caps).expect("serialize weixin caps"),
+            wasm_channels_dir.path().join("wechat.capabilities.json"),
+            serde_json::to_string(&caps).expect("serialize wechat caps"),
         )
-        .expect("write weixin capabilities");
+        .expect("write wechat capabilities");
 
         let state = test_gateway_state(Some(ext_mgr));
         let app = Router::new()
@@ -3130,7 +3130,7 @@ mod tests {
 
         let mut req = axum::http::Request::builder()
             .method("GET")
-            .uri("/api/extensions/weixin/setup")
+            .uri("/api/extensions/wechat/setup")
             .body(Body::empty())
             .expect("request");
         req.extensions_mut().insert(UserIdentity {
@@ -3148,11 +3148,11 @@ mod tests {
             .expect("body");
         let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json response");
 
-        assert_eq!(parsed["name"], "weixin");
+        assert_eq!(parsed["name"], "wechat");
         assert_eq!(parsed["interactive_login"]["method"], "qr_code");
         assert_eq!(
             parsed["interactive_login"]["button_label"],
-            "Connect Weixin"
+            "Connect WeChat"
         );
         assert_eq!(parsed["secrets"], serde_json::json!([]));
         assert_eq!(parsed["fields"], serde_json::json!([]));
@@ -3160,7 +3160,7 @@ mod tests {
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
-    async fn test_extensions_weixin_login_poll_broadcasts_auth_completed_and_activates() {
+    async fn test_extensions_wechat_login_poll_broadcasts_auth_completed_and_activates() {
         use axum::body::Body;
         use tokio::time::{Duration, timeout};
         use tower::ServiceExt;
@@ -3169,19 +3169,19 @@ mod tests {
         let (ext_mgr, _wasm_tools_dir, wasm_channels_dir, db, _db_tmp) =
             test_ext_mgr_with_db(secrets.clone()).await;
 
-        std::fs::write(wasm_channels_dir.path().join("weixin.wasm"), b"\0asm fake")
-            .expect("write fake weixin wasm");
+        std::fs::write(wasm_channels_dir.path().join("wechat.wasm"), b"\0asm fake")
+            .expect("write fake wechat wasm");
         let caps = serde_json::json!({
             "type": "channel",
-            "name": "weixin",
+            "name": "wechat",
             "setup": {
                 "required_secrets": [
-                    {"name": "weixin_bot_token", "prompt": "Connect Weixin"}
+                    {"name": "wechat_bot_token", "prompt": "Connect WeChat"}
                 ]
             },
             "capabilities": {
                 "channel": {
-                    "allowed_paths": ["/webhook/weixin"]
+                    "allowed_paths": ["/webhook/wechat"]
                 }
             },
             "config": {
@@ -3190,10 +3190,10 @@ mod tests {
             }
         });
         std::fs::write(
-            wasm_channels_dir.path().join("weixin.capabilities.json"),
-            serde_json::to_string(&caps).expect("serialize weixin caps"),
+            wasm_channels_dir.path().join("wechat.capabilities.json"),
+            serde_json::to_string(&caps).expect("serialize wechat caps"),
         )
-        .expect("write weixin capabilities");
+        .expect("write wechat capabilities");
 
         let channel_manager = Arc::new(crate::channels::ChannelManager::new());
         let runtime = Arc::new(
@@ -3227,11 +3227,11 @@ mod tests {
             }))
             .await;
         ext_mgr
-            .set_test_weixin_login_starter(Arc::new(|user_id, base_url, bot_type| {
+            .set_test_wechat_login_starter(Arc::new(|user_id, base_url, bot_type| {
                 Ok((
-                    crate::extensions::weixin_login::PendingWeixinLogin {
+                    crate::extensions::wechat_login::PendingWechatLogin {
                         user_id: user_id.to_string(),
-                        session_id: "weixin-session-42".to_string(),
+                        session_id: "wechat-session-42".to_string(),
                         qrcode: "qr-42".to_string(),
                         qr_code_url: "https://qr.example/42".to_string(),
                         started_at: std::time::Instant::now(),
@@ -3240,9 +3240,9 @@ mod tests {
                         refresh_count: 0,
                     },
                     crate::extensions::InteractiveLoginStartResult {
-                        session_id: "weixin-session-42".to_string(),
+                        session_id: "wechat-session-42".to_string(),
                         status: "pending".to_string(),
-                        message: "Scan the QR code in Weixin to finish connecting.".to_string(),
+                        message: "Scan the QR code in WeChat to finish connecting.".to_string(),
                         qr_code_url: Some("https://qr.example/42".to_string()),
                         instructions: Some(
                             "Keep this window open while you scan and confirm on your phone."
@@ -3253,8 +3253,8 @@ mod tests {
             }))
             .await;
         ext_mgr
-            .set_test_weixin_login_poller(Arc::new(|session| {
-                if session.session_id != "weixin-session-42" {
+            .set_test_wechat_login_poller(Arc::new(|session| {
+                if session.session_id != "wechat-session-42" {
                     return Err(crate::extensions::ExtensionError::Other(format!(
                         "unexpected session id: {}",
                         session.session_id
@@ -3262,10 +3262,10 @@ mod tests {
                 }
 
                 Ok(
-                    crate::extensions::weixin_login::WeixinLoginPollOutcome::Confirmed(
-                        crate::extensions::weixin_login::ConfirmedWeixinLogin {
-                            bot_token: "weixin-token-42".to_string(),
-                            base_url: Some("https://weixin.example".to_string()),
+                    crate::extensions::wechat_login::WechatLoginPollOutcome::Confirmed(
+                        crate::extensions::wechat_login::ConfirmedWechatLogin {
+                            bot_token: "wechat-token-42".to_string(),
+                            base_url: Some("https://wechat.example".to_string()),
                             ilink_bot_id: "wx-bot-42".to_string(),
                         },
                     ),
@@ -3288,7 +3288,7 @@ mod tests {
 
         let mut start_req = axum::http::Request::builder()
             .method("POST")
-            .uri("/api/extensions/weixin/login/start")
+            .uri("/api/extensions/wechat/login/start")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"force":true}"#))
             .expect("start request");
@@ -3308,14 +3308,14 @@ mod tests {
             serde_json::from_slice(&start_body).expect("start json response");
         assert_eq!(start_json["success"], serde_json::Value::Bool(true));
         assert_eq!(start_json["status"], "pending");
-        assert_eq!(start_json["session_id"], "weixin-session-42");
+        assert_eq!(start_json["session_id"], "wechat-session-42");
         assert_eq!(start_json["qr_code_url"], "https://qr.example/42");
 
         let mut poll_req = axum::http::Request::builder()
             .method("POST")
-            .uri("/api/extensions/weixin/login/poll")
+            .uri("/api/extensions/wechat/login/poll")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"session_id":"weixin-session-42"}"#))
+            .body(Body::from(r#"{"session_id":"wechat-session-42"}"#))
             .expect("poll request");
         poll_req.extensions_mut().insert(UserIdentity {
             user_id: "test".to_string(),
@@ -3338,7 +3338,7 @@ mod tests {
             poll_json["message"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("Weixin connected as wx-bot-42"),
+                .contains("WeChat connected as wx-bot-42"),
             "unexpected poll message: {poll_json:?}"
         );
 
@@ -3359,26 +3359,26 @@ mod tests {
         })
         .await
         .expect("timed out waiting for auth_completed");
-        assert_eq!(auth_completed.0, "weixin");
+        assert_eq!(auth_completed.0, "wechat");
         assert!(auth_completed.1);
-        assert!(auth_completed.2.contains("Weixin connected as wx-bot-42"));
+        assert!(auth_completed.2.contains("WeChat connected as wx-bot-42"));
 
         assert!(
             secrets
-                .exists("test", "weixin_bot_token")
+                .exists("test", "wechat_bot_token")
                 .await
-                .expect("check weixin secret"),
-            "weixin token should be stored after successful poll"
+                .expect("check wechat secret"),
+            "wechat token should be stored after successful poll"
         );
         assert!(
-            channel_manager.get_channel("weixin").await.is_some(),
-            "weixin should be hot-added after successful poll"
+            channel_manager.get_channel("wechat").await.is_some(),
+            "wechat should be hot-added after successful poll"
         );
         assert_eq!(
-            db.get_setting("test", "extensions.weixin.base_url")
+            db.get_setting("test", "extensions.wechat.base_url")
                 .await
-                .expect("get weixin base_url setting"),
-            Some(serde_json::json!("https://weixin.example"))
+                .expect("get wechat base_url setting"),
+            Some(serde_json::json!("https://wechat.example"))
         );
     }
 

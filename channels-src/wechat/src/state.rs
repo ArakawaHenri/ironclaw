@@ -2,15 +2,15 @@ use std::collections::HashMap;
 
 use crate::auth::{CONFIG_PATH, CONTEXT_TOKENS_PATH, GET_UPDATES_BUF_PATH, SESSION_EXPIRED_PATH};
 use crate::near::agent::channel_host;
-use crate::types::WeixinConfig;
+use crate::types::WechatConfig;
 
-pub fn load_config() -> WeixinConfig {
+pub fn load_config() -> WechatConfig {
     channel_host::workspace_read(CONFIG_PATH)
-        .and_then(|raw| serde_json::from_str::<WeixinConfig>(&raw).ok())
+        .and_then(|raw| serde_json::from_str::<WechatConfig>(&raw).ok())
         .unwrap_or_default()
 }
 
-pub fn persist_config(config: &WeixinConfig) -> Result<(), String> {
+pub fn persist_config(config: &WechatConfig) -> Result<(), String> {
     let serialized =
         serde_json::to_string(config).map_err(|e| format!("Failed to serialize config: {e}"))?;
     channel_host::workspace_write(CONFIG_PATH, &serialized).map_err(|e| e.to_string())

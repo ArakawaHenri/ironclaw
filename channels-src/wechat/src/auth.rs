@@ -1,4 +1,4 @@
-pub const TOKEN_SECRET_NAME: &str = "weixin_bot_token";
+pub const TOKEN_SECRET_NAME: &str = "wechat_bot_token";
 pub const CONFIG_PATH: &str = "config.json";
 pub const GET_UPDATES_BUF_PATH: &str = "state/get_updates_buf.json";
 pub const CONTEXT_TOKENS_PATH: &str = "state/context_tokens.json";

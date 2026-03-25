@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct WeixinConfig {
+pub struct WechatConfig {
     #[serde(default = "default_base_url")]
     pub base_url: String,
     #[serde(default = "default_bot_type")]
@@ -28,7 +28,7 @@ fn default_long_poll_timeout_ms() -> u32 {
     35_000
 }
 
-impl Default for WeixinConfig {
+impl Default for WechatConfig {
     fn default() -> Self {
         Self {
             base_url: default_base_url(),
@@ -59,19 +59,19 @@ pub struct GetUpdatesResponse {
     #[serde(default)]
     pub errmsg: Option<String>,
     #[serde(default)]
-    pub msgs: Vec<WeixinMessage>,
+    pub msgs: Vec<WechatMessage>,
     #[serde(default)]
     pub get_updates_buf: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SendMessageRequest {
-    pub msg: OutboundWeixinMessage,
+    pub msg: OutboundWechatMessage,
     pub base_info: BaseInfo,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct OutboundWeixinMessage {
+pub struct OutboundWechatMessage {
     pub from_user_id: String,
     pub to_user_id: String,
     pub client_id: String,
@@ -83,7 +83,7 @@ pub struct OutboundWeixinMessage {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct WeixinMessage {
+pub struct WechatMessage {
     #[serde(default)]
     pub message_id: Option<i64>,
     #[serde(default)]

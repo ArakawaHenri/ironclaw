@@ -2,8 +2,8 @@ use base64::Engine as _;
 
 use crate::near::agent::channel_host;
 use crate::types::{
-    BaseInfo, GetUpdatesRequest, GetUpdatesResponse, MessageItem, OutboundWeixinMessage,
-    SendMessageRequest, TextItem, WeixinConfig, MESSAGE_ITEM_TEXT, MESSAGE_STATE_FINISH,
+    BaseInfo, GetUpdatesRequest, GetUpdatesResponse, MessageItem, OutboundWechatMessage,
+    SendMessageRequest, TextItem, WechatConfig, MESSAGE_ITEM_TEXT, MESSAGE_STATE_FINISH,
     MESSAGE_TYPE_BOT,
 };
 
@@ -30,7 +30,7 @@ fn request_headers(body: &[u8]) -> String {
     serde_json::json!({
         "Content-Type": "application/json",
         "AuthorizationType": "ilink_bot_token",
-        "Authorization": "Bearer {WEIXIN_BOT_TOKEN}",
+        "Authorization": "Bearer {WECHAT_BOT_TOKEN}",
         "Content-Length": body.len().to_string(),
         "X-WECHAT-UIN": random_wechat_uin(),
     })
@@ -38,7 +38,7 @@ fn request_headers(body: &[u8]) -> String {
 }
 
 pub fn get_updates(
-    config: &WeixinConfig,
+    config: &WechatConfig,
     get_updates_buf: &str,
 ) -> Result<GetUpdatesResponse, String> {
     let body = serde_json::to_vec(&GetUpdatesRequest {
@@ -70,16 +70,16 @@ pub fn get_updates(
 }
 
 pub fn send_text_message(
-    config: &WeixinConfig,
+    config: &WechatConfig,
     to_user_id: &str,
     text: &str,
     context_token: Option<&str>,
 ) -> Result<(), String> {
     let message = SendMessageRequest {
-        msg: OutboundWeixinMessage {
+        msg: OutboundWechatMessage {
             from_user_id: String::new(),
             to_user_id: to_user_id.to_string(),
-            client_id: format!("weixin-{}", channel_host::now_millis()),
+            client_id: format!("wechat-{}", channel_host::now_millis()),
             message_type: MESSAGE_TYPE_BOT,
             message_state: MESSAGE_STATE_FINISH,
             item_list: vec![MessageItem {

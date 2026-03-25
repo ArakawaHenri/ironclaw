@@ -1,27 +1,27 @@
 {
-  "name": "weixin",
-  "display_name": "Weixin Channel",
+  "name": "wechat",
+  "display_name": "WeChat Channel",
   "kind": "channel",
   "version": "0.1.0",
   "wit_version": "0.3.0",
-  "description": "Talk to your agent through a Weixin iLink bot account",
+  "description": "Talk to your agent through a WeChat iLink bot account",
   "keywords": [
     "messaging",
     "chat",
-    "weixin",
+    "wechat",
     "wechat",
     "qr"
   ],
   "source": {
-    "dir": "channels-src/weixin",
-    "capabilities": "weixin.capabilities.json",
-    "crate_name": "weixin-channel"
+    "dir": "channels-src/wechat",
+    "capabilities": "wechat.capabilities.json",
+    "crate_name": "wechat-channel"
   },
   "auth_summary": {
     "method": "interactive",
-    "provider": "Weixin",
+    "provider": "WeChat",
     "secrets": [
-      "weixin_bot_token"
+      "wechat_bot_token"
     ],
     "shared_auth": null,
     "setup_url": "https://ilinkai.weixin.qq.com"

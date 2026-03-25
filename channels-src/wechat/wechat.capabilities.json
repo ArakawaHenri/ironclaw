@@ -2,13 +2,13 @@
   "version": "0.1.0",
   "wit_version": "0.3.0",
   "type": "channel",
-  "name": "weixin",
-  "description": "Weixin iLink Bot channel for direct-message chat via long polling",
+  "name": "wechat",
+  "description": "WeChat iLink Bot channel for direct-message chat via long polling",
   "setup": {
     "required_secrets": [
       {
-        "name": "weixin_bot_token",
-        "prompt": "Connect this channel from the Weixin setup flow. IronClaw stores the bot token after QR login succeeds.",
+        "name": "wechat_bot_token",
+        "prompt": "Connect this channel from the WeChat setup flow. IronClaw stores the bot token after QR login succeeds.",
         "optional": false
       }
     ],
@@ -25,13 +25,13 @@
       }
     },
     "secrets": {
-      "allowed_names": ["weixin_*"]
+      "allowed_names": ["wechat_*"]
     },
     "channel": {
       "allowed_paths": [],
       "allow_polling": true,
       "min_poll_interval_ms": 30000,
-      "workspace_prefix": "channels/weixin/",
+      "workspace_prefix": "channels/wechat/",
       "callback_timeout_secs": 45,
       "emit_rate_limit": {
         "messages_per_minute": 100,

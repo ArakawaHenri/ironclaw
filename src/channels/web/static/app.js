@@ -3251,7 +3251,7 @@ function renderInteractiveLoginPanel() {
 
   const title = document.createElement('div');
   title.className = 'configure-verification-title';
-  title.textContent = 'Weixin QR Login';
+  title.textContent = 'WeChat QR Login';
   panel.appendChild(title);
 
   const status = document.createElement('div');
@@ -3262,7 +3262,7 @@ function renderInteractiveLoginPanel() {
 
   const img = document.createElement('img');
   img.className = 'configure-qr-image';
-  img.alt = 'Weixin QR code';
+  img.alt = 'WeChat QR code';
   img.style.display = 'none';
   img.dataset.qrImage = 'true';
   panel.appendChild(img);
@@ -3322,7 +3322,7 @@ function setInteractiveLoginBusy(overlay, busy, label) {
 function startInteractiveLogin(name, overlay) {
   if (!overlay || !document.body.contains(overlay)) return;
   clearConfigureInlineError(overlay);
-  setConfigureInlineStatus(overlay, 'Generating Weixin QR code...');
+  setConfigureInlineStatus(overlay, 'Generating WeChat QR code...');
   setInteractiveLoginBusy(overlay, true, 'Waiting for scan...');
 
   apiFetch('/api/extensions/' + encodeURIComponent(name) + '/login/start', {
@@ -3332,7 +3332,7 @@ function startInteractiveLogin(name, overlay) {
     .then((res) => {
       if (!overlay || !document.body.contains(overlay)) return;
       if (!res.success || !res.session_id) {
-        setInteractiveLoginBusy(overlay, false, 'Connect Weixin');
+        setInteractiveLoginBusy(overlay, false, 'Connect WeChat');
         setConfigureInlineError(overlay, res.message || 'Failed to start interactive login');
         setConfigureInlineStatus(overlay, '');
         return;
@@ -3345,7 +3345,7 @@ function startInteractiveLogin(name, overlay) {
     })
     .catch((err) => {
       if (!overlay || !document.body.contains(overlay)) return;
-      setInteractiveLoginBusy(overlay, false, 'Connect Weixin');
+      setInteractiveLoginBusy(overlay, false, 'Connect WeChat');
       setConfigureInlineError(overlay, err.message || 'Failed to start interactive login');
       setConfigureInlineStatus(overlay, '');
     });
@@ -3387,14 +3387,14 @@ function pollInteractiveLogin(name, overlay, sessionId) {
         return;
       }
 
-      setInteractiveLoginBusy(overlay, false, 'Connect Weixin');
+      setInteractiveLoginBusy(overlay, false, 'Connect WeChat');
       setConfigureInlineError(overlay, res.message || 'Interactive login failed');
       setConfigureInlineStatus(overlay, '');
     })
     .catch((err) => {
       if (!overlay || !document.body.contains(overlay)) return;
       if (overlay.dataset.interactiveLoginSessionId !== sessionId) return;
-      setInteractiveLoginBusy(overlay, false, 'Connect Weixin');
+      setInteractiveLoginBusy(overlay, false, 'Connect WeChat');
       setConfigureInlineError(overlay, err.message || 'Interactive login failed');
       setConfigureInlineStatus(overlay, '');
     });

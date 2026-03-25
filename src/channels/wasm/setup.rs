@@ -470,7 +470,7 @@ async fn inject_channel_settings_into_config(
     };
 
     let setting_mappings: &[(&str, &str)] = match channel_name {
-        "weixin" => &[("base_url", "extensions.weixin.base_url")],
+        "wechat" => &[("base_url", "extensions.wechat.base_url")],
         _ => return,
     };
 
@@ -505,7 +505,7 @@ mod tests {
     #[tokio::test]
     async fn test_inject_channel_settings_uses_owner_scope() -> Result<(), String> {
         let dir = tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?;
-        let db_path = dir.path().join("weixin-settings.db");
+        let db_path = dir.path().join("wechat-settings.db");
         let db = Arc::new(
             crate::db::libsql::LibSqlBackend::new_local(&db_path)
                 .await
@@ -517,14 +517,14 @@ mod tests {
 
         db.set_setting(
             "default",
-            "extensions.weixin.base_url",
+            "extensions.wechat.base_url",
             &serde_json::json!("https://default.example"),
         )
         .await
         .map_err(|e| format!("persist default setting failed: {e}"))?;
         db.set_setting(
             "owner-123",
-            "extensions.weixin.base_url",
+            "extensions.wechat.base_url",
             &serde_json::json!("https://owner.example"),
         )
         .await
@@ -533,7 +533,7 @@ mod tests {
         let settings_store: Arc<dyn crate::db::SettingsStore> = db;
         let mut config_updates = std::collections::HashMap::new();
         super::inject_channel_settings_into_config(
-            "weixin",
+            "wechat",
             "owner-123",
             Some(&settings_store),
             &mut config_updates,

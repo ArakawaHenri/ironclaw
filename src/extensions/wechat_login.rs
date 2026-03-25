@@ -8,10 +8,10 @@ use crate::extensions::{
     ExtensionError, InteractiveLoginInfo, InteractiveLoginPollResult, InteractiveLoginStartResult,
 };
 
-pub(crate) const WEIXIN_CHANNEL_NAME: &str = "weixin";
-pub(crate) const WEIXIN_BASE_URL_SETTING_PATH: &str = "extensions.weixin.base_url";
-pub(crate) const WEIXIN_DEFAULT_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
-pub(crate) const WEIXIN_DEFAULT_BOT_TYPE: &str = "3";
+pub(crate) const WECHAT_CHANNEL_NAME: &str = "wechat";
+pub(crate) const WECHAT_BASE_URL_SETTING_PATH: &str = "extensions.wechat.base_url";
+pub(crate) const WECHAT_DEFAULT_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
+pub(crate) const WECHAT_DEFAULT_BOT_TYPE: &str = "3";
 
 const LOGIN_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
 const QR_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(35);
@@ -19,7 +19,7 @@ const QR_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_QR_REFRESH_COUNT: u8 = 3;
 
 #[derive(Debug, Clone)]
-pub(crate) struct PendingWeixinLogin {
+pub(crate) struct PendingWechatLogin {
     pub user_id: String,
     pub session_id: String,
     pub qrcode: String,
@@ -30,22 +30,22 @@ pub(crate) struct PendingWeixinLogin {
     pub refresh_count: u8,
 }
 
-impl PendingWeixinLogin {
+impl PendingWechatLogin {
     pub fn is_fresh(&self) -> bool {
         self.started_at.elapsed() < LOGIN_SESSION_TTL
     }
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ConfirmedWeixinLogin {
+pub(crate) struct ConfirmedWechatLogin {
     pub bot_token: String,
     pub base_url: Option<String>,
     pub ilink_bot_id: String,
 }
 
-pub(crate) enum WeixinLoginPollOutcome {
+pub(crate) enum WechatLoginPollOutcome {
     Pending(InteractiveLoginPollResult),
-    Confirmed(ConfirmedWeixinLogin),
+    Confirmed(ConfirmedWechatLogin),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,13 +68,13 @@ struct QrStatusResponse {
 pub(crate) fn interactive_login_info() -> InteractiveLoginInfo {
     InteractiveLoginInfo {
         method: "qr_code".to_string(),
-        button_label: "Connect Weixin".to_string(),
-        instructions: Some("Scan the QR code with Weixin to connect this channel.".to_string()),
+        button_label: "Connect WeChat".to_string(),
+        instructions: Some("Scan the QR code with WeChat to connect this channel.".to_string()),
     }
 }
 
 pub(crate) fn purge_expired_logins(
-    sessions: &mut std::collections::HashMap<String, PendingWeixinLogin>,
+    sessions: &mut std::collections::HashMap<String, PendingWechatLogin>,
 ) {
     sessions.retain(|_, session| session.is_fresh());
 }
@@ -83,20 +83,20 @@ pub(crate) async fn start_login(
     user_id: &str,
     base_url: &str,
     bot_type: &str,
-) -> Result<(PendingWeixinLogin, InteractiveLoginStartResult), ExtensionError> {
+) -> Result<(PendingWechatLogin, InteractiveLoginStartResult), ExtensionError> {
     let qr = fetch_qr_code(base_url, bot_type).await?;
     Ok(build_pending_login(user_id, base_url, bot_type, qr))
 }
 
 pub(crate) async fn poll_login(
-    session: &mut PendingWeixinLogin,
-) -> Result<WeixinLoginPollOutcome, ExtensionError> {
+    session: &mut PendingWechatLogin,
+) -> Result<WechatLoginPollOutcome, ExtensionError> {
     if !session.is_fresh() {
-        return Ok(WeixinLoginPollOutcome::Pending(
+        return Ok(WechatLoginPollOutcome::Pending(
             InteractiveLoginPollResult {
                 session_id: session.session_id.clone(),
                 status: "failed".to_string(),
-                message: "The QR code expired. Start a new Weixin connection.".to_string(),
+                message: "The QR code expired. Start a new WeChat connection.".to_string(),
                 qr_code_url: None,
                 activated: Some(false),
             },
@@ -119,9 +119,9 @@ fn build_pending_login(
     base_url: &str,
     bot_type: &str,
     qr: QrCodeResponse,
-) -> (PendingWeixinLogin, InteractiveLoginStartResult) {
+) -> (PendingWechatLogin, InteractiveLoginStartResult) {
     let session_id = Uuid::new_v4().to_string();
-    let session = PendingWeixinLogin {
+    let session = PendingWechatLogin {
         user_id: user_id.to_string(),
         session_id: session_id.clone(),
         qrcode: qr.qrcode,
@@ -135,7 +135,7 @@ fn build_pending_login(
     let result = InteractiveLoginStartResult {
         session_id,
         status: "pending".to_string(),
-        message: "Scan the QR code in Weixin to finish connecting.".to_string(),
+        message: "Scan the QR code in WeChat to finish connecting.".to_string(),
         qr_code_url: Some(qr.qrcode_img_content),
         instructions: Some(
             "Keep this window open while you scan and confirm on your phone.".to_string(),
@@ -146,12 +146,12 @@ fn build_pending_login(
 }
 
 fn handle_poll_status(
-    session: &mut PendingWeixinLogin,
+    session: &mut PendingWechatLogin,
     status: QrStatusResponse,
     refreshed_qr: Option<QrCodeResponse>,
-) -> Result<WeixinLoginPollOutcome, ExtensionError> {
+) -> Result<WechatLoginPollOutcome, ExtensionError> {
     match status.status.as_str() {
-        "wait" => Ok(WeixinLoginPollOutcome::Pending(
+        "wait" => Ok(WechatLoginPollOutcome::Pending(
             InteractiveLoginPollResult {
                 session_id: session.session_id.clone(),
                 status: "pending".to_string(),
@@ -160,11 +160,11 @@ fn handle_poll_status(
                 activated: None,
             },
         )),
-        "scaned" => Ok(WeixinLoginPollOutcome::Pending(
+        "scaned" => Ok(WechatLoginPollOutcome::Pending(
             InteractiveLoginPollResult {
                 session_id: session.session_id.clone(),
                 status: "scanned".to_string(),
-                message: "QR code scanned. Confirm the login in Weixin.".to_string(),
+                message: "QR code scanned. Confirm the login in WeChat.".to_string(),
                 qr_code_url: None,
                 activated: None,
             },
@@ -172,7 +172,7 @@ fn handle_poll_status(
         "expired" => {
             session.refresh_count = session.refresh_count.saturating_add(1);
             if session.refresh_count > MAX_QR_REFRESH_COUNT {
-                return Ok(WeixinLoginPollOutcome::Pending(
+                return Ok(WechatLoginPollOutcome::Pending(
                     InteractiveLoginPollResult {
                         session_id: session.session_id.clone(),
                         status: "failed".to_string(),
@@ -185,14 +185,14 @@ fn handle_poll_status(
 
             let refreshed = refreshed_qr.ok_or_else(|| {
                 ExtensionError::Other(
-                    "Weixin QR status expired without a refreshed QR code".to_string(),
+                    "WeChat QR status expired without a refreshed QR code".to_string(),
                 )
             })?;
             session.qrcode = refreshed.qrcode;
             session.qr_code_url = refreshed.qrcode_img_content.clone();
             session.started_at = Instant::now();
 
-            Ok(WeixinLoginPollOutcome::Pending(
+            Ok(WechatLoginPollOutcome::Pending(
                 InteractiveLoginPollResult {
                     session_id: session.session_id.clone(),
                     status: "refreshed".to_string(),
@@ -209,29 +209,29 @@ fn handle_poll_status(
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| {
                     ExtensionError::Other(
-                        "Weixin login succeeded but no bot account id was returned".to_string(),
+                        "WeChat login succeeded but no bot account id was returned".to_string(),
                     )
                 })?;
 
             let bot_token = bot_token.ok_or_else(|| {
                 ExtensionError::Other(
-                    "Weixin login succeeded but no bot token was returned".to_string(),
+                    "WeChat login succeeded but no bot token was returned".to_string(),
                 )
             })?;
 
-            Ok(WeixinLoginPollOutcome::Confirmed(ConfirmedWeixinLogin {
+            Ok(WechatLoginPollOutcome::Confirmed(ConfirmedWechatLogin {
                 bot_token,
                 base_url: status.baseurl.filter(|value| !value.trim().is_empty()),
                 ilink_bot_id,
             }))
         }
         other => {
-            tracing::warn!(status = other, "Unexpected Weixin QR status");
-            Ok(WeixinLoginPollOutcome::Pending(
+            tracing::warn!(status = other, "Unexpected WeChat QR status");
+            Ok(WechatLoginPollOutcome::Pending(
                 InteractiveLoginPollResult {
                     session_id: session.session_id.clone(),
                     status: "failed".to_string(),
-                    message: format!("Unexpected Weixin login status: {other}"),
+                    message: format!("Unexpected WeChat login status: {other}"),
                     qr_code_url: None,
                     activated: Some(false),
                 },
@@ -257,27 +257,27 @@ async fn fetch_qr_code(base_url: &str, bot_type: &str) -> Result<QrCodeResponse,
     let client = Client::builder()
         .timeout(QR_FETCH_TIMEOUT)
         .build()
-        .map_err(|e| ExtensionError::Other(format!("Failed to create Weixin login client: {e}")))?;
+        .map_err(|e| ExtensionError::Other(format!("Failed to create WeChat login client: {e}")))?;
 
     let response = client
         .get(&url)
         .send()
         .await
-        .map_err(|e| ExtensionError::Other(format!("Failed to fetch Weixin QR code: {e}")))?;
+        .map_err(|e| ExtensionError::Other(format!("Failed to fetch WeChat QR code: {e}")))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        tracing::warn!(status = %status, "Weixin QR code request failed");
+        tracing::warn!(status = %status, "WeChat QR code request failed");
         return Err(ExtensionError::Other(format!(
-            "Weixin QR code request failed with {status}: {body}"
+            "WeChat QR code request failed with {status}: {body}"
         )));
     }
 
     response
         .json::<QrCodeResponse>()
         .await
-        .map_err(|e| ExtensionError::Other(format!("Failed to parse Weixin QR code response: {e}")))
+        .map_err(|e| ExtensionError::Other(format!("Failed to parse WeChat QR code response: {e}")))
 }
 
 async fn poll_qr_status(base_url: &str, qrcode: &str) -> Result<QrStatusResponse, ExtensionError> {
@@ -289,7 +289,7 @@ async fn poll_qr_status(base_url: &str, qrcode: &str) -> Result<QrStatusResponse
     let client = Client::builder()
         .timeout(QR_LONG_POLL_TIMEOUT)
         .build()
-        .map_err(|e| ExtensionError::Other(format!("Failed to create Weixin poll client: {e}")))?;
+        .map_err(|e| ExtensionError::Other(format!("Failed to create WeChat poll client: {e}")))?;
 
     let response = client
         .get(&url)
@@ -309,7 +309,7 @@ async fn poll_qr_status(base_url: &str, qrcode: &str) -> Result<QrStatusResponse
         }
         Err(error) => {
             return Err(ExtensionError::Other(format!(
-                "Failed to poll Weixin QR status: {error}"
+                "Failed to poll WeChat QR status: {error}"
             )));
         }
     };
@@ -317,22 +317,22 @@ async fn poll_qr_status(base_url: &str, qrcode: &str) -> Result<QrStatusResponse
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        tracing::warn!(status = %status, "Weixin QR status poll failed");
+        tracing::warn!(status = %status, "WeChat QR status poll failed");
         return Err(ExtensionError::Other(format!(
-            "Weixin QR status poll failed with {status}: {body}"
+            "WeChat QR status poll failed with {status}: {body}"
         )));
     }
 
     response
         .json::<QrStatusResponse>()
         .await
-        .map_err(|e| ExtensionError::Other(format!("Failed to parse Weixin QR status: {e}")))
+        .map_err(|e| ExtensionError::Other(format!("Failed to parse WeChat QR status: {e}")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        QrCodeResponse, QrStatusResponse, WeixinLoginPollOutcome, build_pending_login,
+        QrCodeResponse, QrStatusResponse, WechatLoginPollOutcome, build_pending_login,
         handle_poll_status,
     };
 
@@ -385,7 +385,7 @@ mod tests {
         .map_err(|e| e.to_string())?;
 
         match outcome {
-            WeixinLoginPollOutcome::Confirmed(confirmed) => {
+            WechatLoginPollOutcome::Confirmed(confirmed) => {
                 assert_eq!(confirmed.bot_token, "bot-token-123");
                 assert_eq!(confirmed.ilink_bot_id, "wx-bot-1");
                 assert_eq!(
@@ -394,7 +394,7 @@ mod tests {
                 );
                 Ok(())
             }
-            WeixinLoginPollOutcome::Pending(result) => Err(format!(
+            WechatLoginPollOutcome::Pending(result) => Err(format!(
                 "expected confirmed login, got pending status {}",
                 result.status
             )),
@@ -428,7 +428,7 @@ mod tests {
         .map_err(|e| e.to_string())?;
 
         match outcome {
-            WeixinLoginPollOutcome::Pending(result) => {
+            WechatLoginPollOutcome::Pending(result) => {
                 assert_eq!(result.status, "refreshed");
                 assert_eq!(
                     result.qr_code_url.as_deref(),
@@ -438,7 +438,7 @@ mod tests {
                 assert_eq!(session.refresh_count, 1);
                 Ok(())
             }
-            WeixinLoginPollOutcome::Confirmed(_) => {
+            WechatLoginPollOutcome::Confirmed(_) => {
                 Err("expected QR refresh before confirmation".to_string())
             }
         }

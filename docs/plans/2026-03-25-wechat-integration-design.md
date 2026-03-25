@@ -1,8 +1,8 @@
-# Weixin Integration Design
+# WeChat Integration Design
 
 **Date:** 2026-03-25
 **Status:** Ready for implementation
-**Goal:** Add Weixin support to IronClaw using the same upstream iLink Bot protocol as `@tencent-weixin/openclaw-weixin`, while keeping the implementation aligned with IronClaw's extension-first channel architecture.
+**Goal:** Add WeChat support to IronClaw using the same upstream iLink Bot protocol as `@tencent-weixin/openclaw-weixin`, while keeping the implementation aligned with IronClaw's extension-first channel architecture.
 
 ---
 
@@ -10,7 +10,7 @@
 
 The current upstream npm package is `@tencent-weixin/openclaw-weixin` version `2.0.1`.
 
-From the package README and source, the upstream Weixin channel does all of the following:
+From the package README and source, the upstream WeChat channel does all of the following:
 
 - logs in by QR code against `https://ilinkai.weixin.qq.com`
 - receives inbound messages by long-polling `ilink/bot/getupdates`
@@ -18,9 +18,9 @@ From the package README and source, the upstream Weixin channel does all of the 
 - uses `ilink/bot/getconfig` and `ilink/bot/sendtyping` for typing indicators
 - uses `ilink/bot/getuploadurl` for media uploads
 - persists `get_updates_buf` for long-poll resume
-- persists `context_token` so replies stay attached to the right Weixin session
-- supports multiple logged-in Weixin bot accounts
-- treats Weixin as a direct-message-only channel
+- persists `context_token` so replies stay attached to the right WeChat session
+- supports multiple logged-in WeChat bot accounts
+- treats WeChat as a direct-message-only channel
 - block-sends replies instead of token streaming
 
 This design treats that upstream behavior as the capability boundary. We should not add scope based on features the upstream plugin does not have.
@@ -31,7 +31,7 @@ This design treats that upstream behavior as the capability boundary. We should 
 
 IronClaw should **not** try to load the upstream OpenClaw plugin directly.
 
-Instead, IronClaw should implement a **native channel extension** under `channels-src/weixin/` and only extend the host/runtime where that support is generic and reusable.
+Instead, IronClaw should implement a **native channel extension** under `channels-src/wechat/` and only extend the host/runtime where that support is generic and reusable.
 
 ### Why not host the npm plugin directly
 
@@ -39,7 +39,7 @@ Instead, IronClaw should implement a **native channel extension** under `channel
 - It assumes OpenClaw-specific lifecycle concepts such as `gateway.startAccount`.
 - Recreating an OpenClaw-compatible Node plugin host inside IronClaw would be more work and more fragile than implementing the protocol directly.
 
-### Why `channels-src/weixin/`
+### Why `channels-src/wechat/`
 
 - It matches the existing layering used by other platform channels.
 - It keeps platform protocol logic out of host-owned core modules.
@@ -49,10 +49,10 @@ Recommended layout:
 
 ```text
 channels-src/
-  weixin/
+  wechat/
     Cargo.toml
     build.sh
-    weixin.capabilities.json
+    wechat.capabilities.json
     src/
       lib.rs
       api.rs
@@ -65,21 +65,21 @@ channels-src/
 
 ## Phase 1 Scope
 
-Phase 1 is a **single-account** implementation of the upstream Weixin channel.
+Phase 1 is a **single-account** implementation of the upstream WeChat channel.
 
 The point of this phase is to keep the channel aligned with upstream behavior while removing the one biggest source of host/runtime complexity: multi-account lifecycle.
 
 ### Must-have in Phase 1
 
 - QR code login
-- one connected Weixin bot account
+- one connected WeChat bot account
 - direct-message text receive/send
 - `getupdates` long-poll loop
 - `sendmessage` outbound replies
 - `context_token` persistence
 - `get_updates_buf` persistence
 - login persistence across restart
-- extension-first packaging under `channels-src/weixin/`
+- extension-first packaging under `channels-src/wechat/`
 
 ### Explicit simplification from upstream
 
@@ -100,7 +100,7 @@ We should not spend time listing non-goals that come from outside the upstream c
 
 ```mermaid
 flowchart LR
-    A["Core WASM channel host"] --> B["Weixin channel extension"]
+    A["Core WASM channel host"] --> B["WeChat channel extension"]
     C["Generic login UI/API"] --> D["QR login session"]
     D --> E["Secret storage"]
     E --> B
@@ -112,14 +112,14 @@ flowchart LR
 
 ### Extension responsibilities
 
-`channels-src/weixin/` should own:
+`channels-src/wechat/` should own:
 
 - iLink API request/response types
 - QR login protocol calls
 - long-polling `getupdates`
 - `context_token` storage and lookup
 - outbound `sendmessage`
-- Weixin-specific status/error mapping
+- WeChat-specific status/error mapping
 
 ### Host responsibilities
 
@@ -139,7 +139,7 @@ Phase 1 is single-account, so state should stay simple.
 
 ### Secrets
 
-- `weixin_bot_token`
+- `wechat_bot_token`
 
 This is written after QR login succeeds and reused on restart.
 
@@ -150,16 +150,16 @@ Under the channel workspace prefix, persist:
 - `state/get_updates_buf.json`
 - `state/context_tokens.json`
 
-`context_tokens.json` maps the Weixin peer to its latest `context_token`.
+`context_tokens.json` maps the WeChat peer to its latest `context_token`.
 
 ### Inbound message mapping
 
-For each inbound Weixin DM:
+For each inbound WeChat DM:
 
-- `channel = "weixin"`
-- `user_id = <weixin sender id>` or owner scope if it is the bound owner
-- `thread_id = Some("weixin:<sender_id>")`
-- `conversation_scope_id = Some("weixin:<sender_id>")`
+- `channel = "wechat"`
+- `user_id = <wechat sender id>` or owner scope if it is the bound owner
+- `thread_id = Some("wechat:<sender_id>")`
+- `conversation_scope_id = Some("wechat:<sender_id>")`
 
 `metadata_json` should include:
 
@@ -184,22 +184,22 @@ Minimum host support needed:
 4. On success, write the returned token to channel secrets.
 5. Reload or reactivate the channel so polling starts automatically.
 
-This should be added as a generic channel-auth capability, not as Weixin-specific core logic.
+This should be added as a generic channel-auth capability, not as WeChat-specific core logic.
 
 ---
 
 ## User Flow
 
-Phase 1 should be **web-first**, because the target user is a normal Weixin user rather than a CLI-only operator.
+Phase 1 should be **web-first**, because the target user is a normal WeChat user rather than a CLI-only operator.
 
-1. Install or enable the `weixin` channel extension.
-2. Click "Connect Weixin".
+1. Install or enable the `wechat` channel extension.
+2. Click "Connect WeChat".
 3. Web UI requests a login session from the host.
 4. Web UI displays the QR code.
 5. User scans and confirms on their phone.
-6. Host stores `weixin_bot_token`.
+6. Host stores `wechat_bot_token`.
 7. Channel reloads and starts polling.
-8. User sends a DM in Weixin and receives IronClaw replies there.
+8. User sends a DM in WeChat and receives IronClaw replies there.
 
 CLI support can still exist for development, but it should not be the primary Phase 1 UX.
 
@@ -259,9 +259,3 @@ After Phase 1 is stable, add the upstream features we intentionally deferred:
 - multi-account support
 - typing indicators
 - media upload/send
-
----
-
-## Open Question
-
-- Should the public channel name remain `weixin`, or should we preserve an upstream-flavored alias for discoverability?

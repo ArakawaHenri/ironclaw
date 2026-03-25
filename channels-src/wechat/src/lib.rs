@@ -21,20 +21,20 @@ use crate::state::{
     session_expired,
 };
 use crate::types::{
-    OutboundMetadata, WeixinConfig, WeixinMessage, MESSAGE_ITEM_TEXT, MESSAGE_TYPE_USER,
+    OutboundMetadata, WechatConfig, WechatMessage, MESSAGE_ITEM_TEXT, MESSAGE_TYPE_USER,
 };
 
-struct WeixinChannel;
+struct WechatChannel;
 
-impl Guest for WeixinChannel {
+impl Guest for WechatChannel {
     fn on_start(config_json: String) -> Result<ChannelConfig, String> {
-        let config = serde_json::from_str::<WeixinConfig>(&config_json)
-            .map_err(|e| format!("Failed to parse Weixin config: {e}"))?;
+        let config = serde_json::from_str::<WechatConfig>(&config_json)
+            .map_err(|e| format!("Failed to parse WeChat config: {e}"))?;
         persist_config(&config)?;
         clear_session_expired();
 
         Ok(ChannelConfig {
-            display_name: "Weixin".to_string(),
+            display_name: "WeChat".to_string(),
             http_endpoints: Vec::new(),
             poll: Some(PollConfig {
                 interval_ms: config.poll_interval_ms.max(30_000),
@@ -49,7 +49,7 @@ impl Guest for WeixinChannel {
         exports::near::agent::channel::OutgoingHttpResponse {
             status: 404,
             headers_json: "{}".to_string(),
-            body: b"{\"error\":\"weixin channel does not expose webhooks\"}".to_vec(),
+            body: b"{\"error\":\"wechat channel does not expose webhooks\"}".to_vec(),
         }
     }
 
@@ -57,7 +57,7 @@ impl Guest for WeixinChannel {
         if session_expired() {
             channel_host::log(
                 channel_host::LogLevel::Warn,
-                "Weixin session is marked expired; reconnect the channel to resume polling",
+                "WeChat session is marked expired; reconnect the channel to resume polling",
             );
             return;
         }
@@ -65,7 +65,7 @@ impl Guest for WeixinChannel {
         if !channel_host::secret_exists(TOKEN_SECRET_NAME) {
             channel_host::log(
                 channel_host::LogLevel::Warn,
-                "Weixin bot token is missing; skipping poll",
+                "WeChat bot token is missing; skipping poll",
             );
             return;
         }
@@ -80,7 +80,7 @@ impl Guest for WeixinChannel {
                     mark_session_expired();
                     channel_host::log(
                         channel_host::LogLevel::Error,
-                        "Weixin session expired; reconnect the channel",
+                        "WeChat session expired; reconnect the channel",
                     );
                     return;
                 }
@@ -89,11 +89,11 @@ impl Guest for WeixinChannel {
                     let errmsg = response
                         .errmsg
                         .as_deref()
-                        .unwrap_or("unknown Weixin polling error");
+                        .unwrap_or("unknown WeChat polling error");
                     channel_host::log(
                         channel_host::LogLevel::Warn,
                         &format!(
-                            "Weixin getUpdates returned ret={} errmsg={errmsg}",
+                            "WeChat getUpdates returned ret={} errmsg={errmsg}",
                             response.ret.unwrap_or(-1)
                         ),
                     );
@@ -104,7 +104,7 @@ impl Guest for WeixinChannel {
                         if let Err(error) = persist_get_updates_buf(next_cursor) {
                             channel_host::log(
                                 channel_host::LogLevel::Warn,
-                                &format!("Failed to persist Weixin polling cursor: {error}"),
+                                &format!("Failed to persist WeChat polling cursor: {error}"),
                             );
                         }
                     }
@@ -128,7 +128,7 @@ impl Guest for WeixinChannel {
                     if let Err(error) = persist_context_tokens(&context_tokens) {
                         channel_host::log(
                             channel_host::LogLevel::Warn,
-                            &format!("Failed to persist Weixin context tokens: {error}"),
+                            &format!("Failed to persist WeChat context tokens: {error}"),
                         );
                     }
                 }
@@ -136,7 +136,7 @@ impl Guest for WeixinChannel {
             Err(error) => {
                 channel_host::log(
                     channel_host::LogLevel::Error,
-                    &format!("Weixin polling failed: {error}"),
+                    &format!("WeChat polling failed: {error}"),
                 );
             }
         }
@@ -144,7 +144,7 @@ impl Guest for WeixinChannel {
 
     fn on_respond(response: AgentResponse) -> Result<(), String> {
         let metadata = serde_json::from_str::<OutboundMetadata>(&response.metadata_json)
-            .map_err(|e| format!("Invalid Weixin response metadata: {e}"))?;
+            .map_err(|e| format!("Invalid WeChat response metadata: {e}"))?;
         let config = load_config();
         let context_tokens = load_context_tokens();
         let context_token = metadata
@@ -169,7 +169,7 @@ impl Guest for WeixinChannel {
     fn on_shutdown() {}
 }
 
-fn emit_incoming_message(message: WeixinMessage) {
+fn emit_incoming_message(message: WechatMessage) {
     if message.message_type != Some(MESSAGE_TYPE_USER) {
         return;
     }
@@ -195,13 +195,13 @@ fn emit_incoming_message(message: WeixinMessage) {
         user_id: from_user_id.to_string(),
         user_name: None,
         content: text,
-        thread_id: Some(format!("weixin:{from_user_id}")),
+        thread_id: Some(format!("wechat:{from_user_id}")),
         metadata_json: metadata.to_string(),
         attachments: Vec::new(),
     });
 }
 
-fn extract_text(message: &WeixinMessage) -> String {
+fn extract_text(message: &WechatMessage) -> String {
     message
         .item_list
         .iter()
@@ -215,4 +215,4 @@ fn extract_text(message: &WeixinMessage) -> String {
         .unwrap_or_default()
 }
 
-export!(WeixinChannel);
+export!(WechatChannel);
