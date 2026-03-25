@@ -839,18 +839,13 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                             .insert(tc.id.clone(), output.clone());
                     }
 
-                    // Sanitize and add tool result to context
                     let is_tool_error = tool_result.is_err();
-                    let result_content = match tool_result {
-                        Ok(output) => {
-                            let sanitized =
-                                self.agent.safety().sanitize_tool_output(&tc.name, &output);
-                            self.agent
-                                .safety()
-                                .wrap_for_llm(&tc.name, &sanitized.content)
-                        }
-                        Err(e) => format!("Tool '{}' failed: {}", tc.name, e),
-                    };
+                    let (result_content, tool_message) = crate::tools::execute::process_tool_result(
+                        self.agent.safety(),
+                        &tc.name,
+                        &tc.id,
+                        &tool_result,
+                    );
 
                     // Record sanitized result in thread
                     {
@@ -866,11 +861,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                         }
                     }
 
-                    reason_ctx.messages.push(ChatMessage::tool_result(
-                        &tc.id,
-                        &tc.name,
-                        result_content,
-                    ));
+                    reason_ctx.messages.push(tool_message);
                 }
             }
         }
@@ -2384,15 +2375,23 @@ mod tests {
 
     #[test]
     fn test_tool_error_format_includes_tool_name() {
-        // Regression test for issue #487: tool errors sent to the LLM should
-        // include the tool name so the model can reason about which tool failed
-        // and try alternatives.
         let tool_name = "http";
         let err = crate::error::ToolError::ExecutionFailed {
             name: tool_name.to_string(),
             reason: "connection refused".to_string(),
         };
-        let formatted = format!("Tool '{}' failed: {}", tool_name, err);
+        let safety = crate::safety::SafetyLayer::new(&crate::config::SafetyConfig {
+            max_output_length: 1000,
+            injection_check_enabled: true,
+        });
+        let result: Result<String, _> = Err(err);
+        let (formatted, message) = crate::tools::execute::process_tool_result(
+            &safety,
+            tool_name,
+            "call_1",
+            &result,
+        );
+
         assert!(
             formatted.contains("Tool 'http' failed:"),
             "Error should identify the tool by name, got: {formatted}"
@@ -2401,6 +2400,11 @@ mod tests {
             formatted.contains("connection refused"),
             "Error should include the underlying reason, got: {formatted}"
         );
+        assert!(
+            formatted.contains("tool_output"),
+            "Error should be wrapped before entering LLM context, got: {formatted}"
+        );
+        assert_eq!(message.content, formatted);
     }
 
     #[test]
