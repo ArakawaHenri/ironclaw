@@ -1853,11 +1853,10 @@ fn rebuild_chat_messages_from_db(
                             let name = c["name"].as_str().unwrap_or("unknown").to_string();
                             let content = if let Some(err) = c.get("error").and_then(|v| v.as_str())
                             {
-                                if ironclaw_safety::SafetyLayer::unwrap_tool_output(err).is_some() {
-                                    err.to_string()
-                                } else {
-                                    format!("Error: {}", err)
-                                }
+                                // Both wrapped (new) and legacy (plain) errors pass
+                                // through as-is. Legacy errors are already descriptive
+                                // (e.g. "Tool 'http' failed: timeout"), so no prefix needed.
+                                err.to_string()
                             } else if let Some(res) = c.get("result").and_then(|v| v.as_str()) {
                                 res.to_string()
                             } else if let Some(preview) =
@@ -1943,7 +1942,7 @@ mod tests {
 
         assert_eq!(result[3].role, crate::llm::Role::Tool);
         assert_eq!(result[3].tool_call_id, Some("call_1".to_string()));
-        assert!(result[3].content.contains("Error: timeout"));
+        assert!(result[3].content.contains("timeout"));
 
         // final assistant
         assert_eq!(result[4].role, crate::llm::Role::Assistant);

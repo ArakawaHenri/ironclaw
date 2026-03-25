@@ -120,6 +120,7 @@ pub async fn execute_tool_with_safety(
 /// Process a tool result into a `ChatMessage::tool_result` with safety sanitization.
 ///
 /// On success: sanitize → wrap → ChatMessage::tool_result.
+/// On error: format error → sanitize → wrap → ChatMessage::tool_result.
 ///
 /// Returns the content string and the ChatMessage.
 pub fn process_tool_result(
