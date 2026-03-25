@@ -4,6 +4,8 @@
 //! pipeline used by all agentic loop consumers (chat, job, container) and the
 //! scheduler's subtask execution.
 
+use std::borrow::Cow;
+
 use crate::context::JobContext;
 use crate::error::Error;
 use crate::llm::ChatMessage;
@@ -127,8 +129,8 @@ pub fn process_tool_result(
     result: &Result<String, impl std::fmt::Display>,
 ) -> (String, ChatMessage) {
     let raw_content = match result {
-        Ok(output) => output.clone(),
-        Err(e) => format!("Tool '{}' failed: {}", tool_name, e),
+        Ok(output) => Cow::Borrowed(output.as_str()),
+        Err(e) => Cow::Owned(format!("Tool '{}' failed: {}", tool_name, e)),
     };
     let sanitized = safety.sanitize_tool_output(tool_name, &raw_content);
     let content = safety.wrap_for_llm(tool_name, &sanitized.content);
