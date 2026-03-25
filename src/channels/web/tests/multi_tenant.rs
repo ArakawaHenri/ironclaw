@@ -79,6 +79,7 @@ fn build_state(
         routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
         startup_time: std::time::Instant::now(),
         active_config: ActiveConfigSnapshot::default(),
+        secrets_store: None,
     })
 }
 

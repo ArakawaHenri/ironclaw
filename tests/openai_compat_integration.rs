@@ -217,6 +217,7 @@ async fn start_test_server_with_provider(
         routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
         startup_time: std::time::Instant::now(),
         active_config: ironclaw::channels::web::server::ActiveConfigSnapshot::default(),
+        secrets_store: None,
     });
 
     let auth = ironclaw::channels::web::auth::MultiAuthState::single(
@@ -715,6 +716,7 @@ async fn test_no_llm_provider_returns_503() {
         routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
         startup_time: std::time::Instant::now(),
         active_config: ironclaw::channels::web::server::ActiveConfigSnapshot::default(),
+        secrets_store: None,
     });
 
     let auth = ironclaw::channels::web::auth::MultiAuthState::single(

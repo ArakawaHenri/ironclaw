@@ -381,6 +381,8 @@ pub struct GatewayState {
     pub startup_time: std::time::Instant,
     /// Snapshot of active (resolved) configuration for the frontend.
     pub active_config: ActiveConfigSnapshot,
+    /// Secrets store for encrypting LLM API keys (and future sensitive settings).
+    pub secrets_store: Option<Arc<dyn crate::secrets::SecretsStore + Send + Sync>>,
 }
 
 /// Start the gateway HTTP server.
@@ -2955,9 +2957,11 @@ async fn llm_env_defaults_handler() -> Json<serde_json::Value> {
     // NEAR AI is a special case (not in the registry)
     {
         let mut entry = serde_json::Map::new();
-        if let Some(key) = read_env("NEARAI_API_KEY") {
-            entry.insert("api_key".to_string(), serde_json::Value::String(key));
-        }
+        // Only expose presence of API key, never the value itself.
+        entry.insert(
+            "has_api_key".to_string(),
+            serde_json::Value::Bool(read_env("NEARAI_API_KEY").is_some()),
+        );
         if let Some(model) = read_env("NEARAI_MODEL") {
             entry.insert("model".to_string(), serde_json::Value::String(model));
         }
@@ -2971,10 +2975,11 @@ async fn llm_env_defaults_handler() -> Json<serde_json::Value> {
     for def in registry.all() {
         let mut entry = serde_json::Map::new();
 
-        if let Some(ref api_key_env) = def.api_key_env
-            && let Some(key) = read_env(api_key_env)
-        {
-            entry.insert("api_key".to_string(), serde_json::Value::String(key));
+        if let Some(ref api_key_env) = def.api_key_env {
+            entry.insert(
+                "has_api_key".to_string(),
+                serde_json::Value::Bool(read_env(api_key_env).is_some()),
+            );
         }
 
         if let Some(model) = read_env(&def.model_env) {
@@ -3257,9 +3262,14 @@ mod tests {
             .get("nearai")
             .and_then(|v| v.as_object())
             .expect("nearai entry");
+        // API key should NOT be exposed — only has_api_key presence flag.
         assert_eq!(
-            nearai.get("api_key").and_then(|v| v.as_str()),
-            Some("test-key-123")
+            nearai.get("has_api_key").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(
+            nearai.get("api_key").is_none(),
+            "raw api_key must never be returned"
         );
         assert_eq!(
             nearai.get("model").and_then(|v| v.as_str()),
@@ -3326,6 +3336,7 @@ mod tests {
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
             startup_time: std::time::Instant::now(),
             active_config: ActiveConfigSnapshot::default(),
+            secrets_store: None,
         })
     }
 

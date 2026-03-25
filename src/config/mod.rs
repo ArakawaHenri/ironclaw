@@ -298,7 +298,19 @@ impl Config {
         user_id: &str,
         toml_path: Option<&std::path::Path>,
     ) -> Result<(), ConfigError> {
-        let settings = if let Some(store) = store {
+        self.re_resolve_llm_with_secrets(store, user_id, toml_path, None)
+            .await
+    }
+
+    /// Re-resolve LLM config, hydrating API keys from the secrets store.
+    pub async fn re_resolve_llm_with_secrets(
+        &mut self,
+        store: Option<&(dyn crate::db::SettingsStore + Sync)>,
+        user_id: &str,
+        toml_path: Option<&std::path::Path>,
+        secrets: Option<&(dyn crate::secrets::SecretsStore + Send + Sync)>,
+    ) -> Result<(), ConfigError> {
+        let mut settings = if let Some(store) = store {
             // TOML as base, then DB on top (DB wins).
             let mut s = Settings::default();
             Self::apply_toml_overlay(&mut s, toml_path)?;
@@ -310,6 +322,14 @@ impl Config {
         } else {
             Settings::default()
         };
+
+        // Hydrate API keys from encrypted secrets store into the settings
+        // struct so that LlmConfig::resolve() sees them without any changes
+        // to its synchronous resolution logic.
+        if let Some(secrets) = secrets {
+            hydrate_llm_keys_from_secrets(&mut settings, secrets, user_id).await;
+        }
+
         self.llm = LlmConfig::resolve(&settings)?;
         Ok(())
     }
@@ -510,5 +530,163 @@ fn inject_os_credential_store_tokens(injected: &mut HashMap<String, String>) {
     if let Some(fresh) = crate::config::ClaudeCodeConfig::extract_oauth_token() {
         injected.insert("ANTHROPIC_OAUTH_TOKEN".to_string(), fresh);
         tracing::debug!("Refreshed ANTHROPIC_OAUTH_TOKEN from OS credential store");
+    }
+}
+
+/// Hydrate LLM API keys from the secrets store into the settings struct.
+///
+/// Called after loading settings from DB but before `LlmConfig::resolve()`.
+/// Populates `api_key` fields that were stripped from settings during the
+/// write path and stored encrypted in the secrets store instead.
+pub async fn hydrate_llm_keys_from_secrets(
+    settings: &mut Settings,
+    secrets: &(dyn crate::secrets::SecretsStore + Send + Sync),
+    user_id: &str,
+) {
+    // Hydrate builtin overrides
+    for (provider_id, override_val) in settings.llm_builtin_overrides.iter_mut() {
+        if override_val.api_key.is_some() {
+            continue; // Already has a key (legacy plaintext or TOML)
+        }
+        let secret_name = format!("llm_builtin_{}_api_key", provider_id);
+        if let Ok(decrypted) = secrets.get_decrypted(user_id, &secret_name).await {
+            override_val.api_key = Some(decrypted.expose().to_string());
+        }
+    }
+
+    // Hydrate custom providers
+    for provider in settings.llm_custom_providers.iter_mut() {
+        if provider.api_key.is_some() {
+            continue;
+        }
+        let secret_name = format!("llm_custom_{}_api_key", provider.id);
+        if let Ok(decrypted) = secrets.get_decrypted(user_id, &secret_name).await {
+            provider.api_key = Some(decrypted.expose().to_string());
+        }
+    }
+}
+
+/// Migrate plaintext API keys from the settings table to the encrypted secrets store.
+///
+/// Idempotent: skips keys that are already in the secrets store.
+/// After migration, strips plaintext keys from the settings table.
+pub async fn migrate_plaintext_llm_keys(
+    settings_store: &(dyn crate::db::SettingsStore + Sync),
+    secrets: &(dyn crate::secrets::SecretsStore + Send + Sync),
+    user_id: &str,
+) {
+    let settings_map = match settings_store.get_all_settings(user_id).await {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+
+    let mut migrated = 0u32;
+
+    // Migrate builtin overrides
+    if let Some(obj) = settings_map
+        .get("llm_builtin_overrides")
+        .and_then(|v| v.as_object())
+    {
+        let mut sanitized = obj.clone();
+        for (provider_id, override_val) in obj {
+            if let Some(api_key) = override_val.get("api_key").and_then(|v| v.as_str()) {
+                if api_key.is_empty() {
+                    continue;
+                }
+                let secret_name = format!("llm_builtin_{}_api_key", provider_id);
+                if !secrets.exists(user_id, &secret_name).await.unwrap_or(false)
+                    && let Err(e) = secrets
+                        .create(
+                            user_id,
+                            crate::secrets::CreateSecretParams {
+                                name: secret_name.clone(),
+                                value: secrecy::SecretString::from(api_key.to_string()),
+                                provider: Some(provider_id.clone()),
+                                expires_at: None,
+                            },
+                        )
+                        .await
+                {
+                    tracing::warn!("Failed to migrate key for builtin '{}': {}", provider_id, e);
+                    continue;
+                }
+                if let Some(o) = sanitized
+                    .get_mut(provider_id)
+                    .and_then(|v| v.as_object_mut())
+                {
+                    o.remove("api_key");
+                }
+                migrated += 1;
+            }
+        }
+        if migrated > 0 {
+            let _ = settings_store
+                .set_setting(
+                    user_id,
+                    "llm_builtin_overrides",
+                    &serde_json::Value::Object(sanitized),
+                )
+                .await;
+        }
+    }
+
+    // Migrate custom providers
+    let before = migrated;
+    if let Some(arr) = settings_map
+        .get("llm_custom_providers")
+        .and_then(|v| v.as_array())
+    {
+        let mut sanitized = arr.clone();
+        for (idx, provider_val) in arr.iter().enumerate() {
+            let provider_id = provider_val
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if provider_id.is_empty() {
+                continue;
+            }
+            if let Some(api_key) = provider_val.get("api_key").and_then(|v| v.as_str()) {
+                if api_key.is_empty() {
+                    continue;
+                }
+                let secret_name = format!("llm_custom_{}_api_key", provider_id);
+                if !secrets.exists(user_id, &secret_name).await.unwrap_or(false)
+                    && let Err(e) = secrets
+                        .create(
+                            user_id,
+                            crate::secrets::CreateSecretParams {
+                                name: secret_name.clone(),
+                                value: secrecy::SecretString::from(api_key.to_string()),
+                                provider: Some(provider_id.to_string()),
+                                expires_at: None,
+                            },
+                        )
+                        .await
+                {
+                    tracing::warn!("Failed to migrate key for custom '{}': {}", provider_id, e);
+                    continue;
+                }
+                if let Some(o) = sanitized[idx].as_object_mut() {
+                    o.remove("api_key");
+                }
+                migrated += 1;
+            }
+        }
+        if migrated > before {
+            let _ = settings_store
+                .set_setting(
+                    user_id,
+                    "llm_custom_providers",
+                    &serde_json::Value::Array(sanitized),
+                )
+                .await;
+        }
+    }
+
+    if migrated > 0 {
+        tracing::info!(
+            "Migrated {} plaintext LLM API key(s) to encrypted secrets store",
+            migrated
+        );
     }
 }

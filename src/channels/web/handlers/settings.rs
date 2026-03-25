@@ -7,10 +7,15 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
 };
+use secrecy::SecretString;
 
 use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::server::GatewayState;
 use crate::channels::web::types::*;
+use crate::secrets::{CreateSecretParams, SecretsStore};
+
+/// Sentinel value the frontend sends to mean "key is unchanged, don't touch it".
+const API_KEY_UNCHANGED: &str = "••••••••";
 
 pub async fn settings_list_handler(
     State(state): State<Arc<GatewayState>>,
@@ -79,8 +84,20 @@ pub async fn settings_set_handler(
         validate_custom_providers_adapters(&body.value)?;
     }
 
+    // Extract API keys from LLM settings and vault them in the secrets store.
+    // The sanitized value has api_key fields removed (stored encrypted instead).
+    let sanitized_value = match key.as_str() {
+        "llm_builtin_overrides" => {
+            extract_builtin_override_keys(&state, &user.user_id, &body.value).await?
+        }
+        "llm_custom_providers" => {
+            extract_custom_provider_keys(&state, &user.user_id, &body.value).await?
+        }
+        _ => body.value.clone(),
+    };
+
     store
-        .set_setting(&user.user_id, &key, &body.value)
+        .set_setting(&user.user_id, &key, &sanitized_value)
         .await
         .map_err(|e| {
             tracing::error!("Failed to set setting '{}': {}", key, e);
@@ -202,10 +219,15 @@ pub async fn settings_export_handler(
         .store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let settings = store.get_all_settings(&user.user_id).await.map_err(|e| {
+    let mut settings = store.get_all_settings(&user.user_id).await.map_err(|e| {
         tracing::error!("Failed to export settings: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    // Indicate key presence from secrets store without exposing values.
+    annotate_secret_key_presence(&state, &user.user_id, &mut settings).await;
+
+    mask_settings_api_keys(&mut settings);
 
     Ok(Json(SettingsExportResponse { settings }))
 }
@@ -228,4 +250,463 @@ pub async fn settings_import_handler(
         })?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// LLM API key vaulting helpers
+// ---------------------------------------------------------------------------
+
+/// Canonical secret name for a built-in provider's API key.
+fn builtin_secret_name(provider_id: &str) -> String {
+    format!("llm_builtin_{}_api_key", provider_id)
+}
+
+/// Canonical secret name for a custom provider's API key.
+fn custom_secret_name(provider_id: &str) -> String {
+    format!("llm_custom_{}_api_key", provider_id)
+}
+
+/// Extract API keys from builtin overrides, store in secrets, return sanitized JSON.
+async fn extract_builtin_override_keys(
+    state: &GatewayState,
+    user_id: &str,
+    value: &serde_json::Value,
+) -> Result<serde_json::Value, StatusCode> {
+    let secrets = match state.secrets_store.as_ref() {
+        Some(s) => s,
+        None => return Ok(value.clone()),
+    };
+
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => return Ok(value.clone()),
+    };
+
+    let mut sanitized = obj.clone();
+
+    for (provider_id, override_val) in obj {
+        if let Some(api_key) = override_val.get("api_key").and_then(|v| v.as_str()) {
+            if api_key == API_KEY_UNCHANGED || api_key.is_empty() {
+                // Unchanged or empty — remove from settings, keep existing secret.
+                if let Some(o) = sanitized
+                    .get_mut(provider_id)
+                    .and_then(|v| v.as_object_mut())
+                {
+                    o.remove("api_key");
+                }
+                continue;
+            }
+            vault_secret(
+                secrets.as_ref(),
+                user_id,
+                &builtin_secret_name(provider_id),
+                api_key,
+                provider_id,
+            )
+            .await?;
+            if let Some(o) = sanitized
+                .get_mut(provider_id)
+                .and_then(|v| v.as_object_mut())
+            {
+                o.remove("api_key");
+            }
+        }
+    }
+
+    Ok(serde_json::Value::Object(sanitized))
+}
+
+/// Extract API keys from custom providers, store in secrets, return sanitized JSON.
+async fn extract_custom_provider_keys(
+    state: &GatewayState,
+    user_id: &str,
+    value: &serde_json::Value,
+) -> Result<serde_json::Value, StatusCode> {
+    let secrets = match state.secrets_store.as_ref() {
+        Some(s) => s,
+        None => return Ok(value.clone()),
+    };
+
+    let arr = match value.as_array() {
+        Some(a) => a,
+        None => return Ok(value.clone()),
+    };
+
+    let mut sanitized = arr.clone();
+
+    for (idx, provider_val) in arr.iter().enumerate() {
+        let provider_id = provider_val
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if provider_id.is_empty() {
+            continue;
+        }
+
+        if let Some(api_key) = provider_val.get("api_key").and_then(|v| v.as_str()) {
+            if api_key == API_KEY_UNCHANGED || api_key.is_empty() {
+                if let Some(o) = sanitized[idx].as_object_mut() {
+                    o.remove("api_key");
+                }
+                continue;
+            }
+            vault_secret(
+                secrets.as_ref(),
+                user_id,
+                &custom_secret_name(provider_id),
+                api_key,
+                provider_id,
+            )
+            .await?;
+            if let Some(o) = sanitized[idx].as_object_mut() {
+                o.remove("api_key");
+            }
+        }
+    }
+
+    Ok(serde_json::Value::Array(sanitized))
+}
+
+/// Encrypt and store an API key in the secrets store.
+async fn vault_secret(
+    secrets: &(dyn SecretsStore + Send + Sync),
+    user_id: &str,
+    secret_name: &str,
+    api_key: &str,
+    provider_id: &str,
+) -> Result<(), StatusCode> {
+    secrets
+        .create(
+            user_id,
+            CreateSecretParams {
+                name: secret_name.to_string(),
+                value: SecretString::from(api_key.to_string()),
+                provider: Some(provider_id.to_string()),
+                expires_at: None,
+            },
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                "Failed to store secret '{}' for provider '{}': {}",
+                secret_name,
+                provider_id,
+                e
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(())
+}
+
+/// Mask plaintext API keys in settings values before returning to the frontend.
+///
+/// Any `api_key` field still present in the settings JSON (legacy plaintext)
+/// is replaced with the sentinel so the frontend shows "key configured".
+fn mask_settings_api_keys(settings: &mut std::collections::HashMap<String, serde_json::Value>) {
+    if let Some(obj) = settings
+        .get_mut("llm_builtin_overrides")
+        .and_then(|v| v.as_object_mut())
+    {
+        for override_val in obj.values_mut() {
+            if let Some(o) = override_val.as_object_mut()
+                && o.contains_key("api_key")
+            {
+                o.insert(
+                    "api_key".to_string(),
+                    serde_json::Value::String(API_KEY_UNCHANGED.to_string()),
+                );
+            }
+        }
+    }
+
+    if let Some(arr) = settings
+        .get_mut("llm_custom_providers")
+        .and_then(|v| v.as_array_mut())
+    {
+        for provider_val in arr.iter_mut() {
+            if let Some(o) = provider_val.as_object_mut()
+                && o.contains_key("api_key")
+            {
+                o.insert(
+                    "api_key".to_string(),
+                    serde_json::Value::String(API_KEY_UNCHANGED.to_string()),
+                );
+            }
+        }
+    }
+}
+
+/// Check the secrets store for vaulted API keys and annotate the settings map.
+///
+/// For builtin overrides and custom providers whose API key was stripped from
+/// settings (stored in secrets), this adds `api_key: "••••••••"` so the
+/// frontend knows a key is configured without seeing the actual value.
+async fn annotate_secret_key_presence(
+    state: &GatewayState,
+    user_id: &str,
+    settings: &mut std::collections::HashMap<String, serde_json::Value>,
+) {
+    let secrets = match state.secrets_store.as_ref() {
+        Some(s) => s,
+        None => return,
+    };
+
+    // Annotate builtin overrides
+    if let Some(obj) = settings
+        .get_mut("llm_builtin_overrides")
+        .and_then(|v| v.as_object_mut())
+    {
+        let provider_ids: Vec<String> = obj.keys().cloned().collect();
+        for provider_id in provider_ids {
+            let has_key_in_settings = obj
+                .get(&provider_id)
+                .and_then(|v| v.get("api_key"))
+                .is_some();
+            if has_key_in_settings {
+                continue; // Will be masked by mask_settings_api_keys
+            }
+            let secret_name = builtin_secret_name(&provider_id);
+            if secrets.exists(user_id, &secret_name).await.unwrap_or(false)
+                && let Some(o) = obj.get_mut(&provider_id).and_then(|v| v.as_object_mut())
+            {
+                o.insert(
+                    "api_key".to_string(),
+                    serde_json::Value::String(API_KEY_UNCHANGED.to_string()),
+                );
+            }
+        }
+    }
+
+    // Annotate custom providers
+    if let Some(arr) = settings
+        .get_mut("llm_custom_providers")
+        .and_then(|v| v.as_array_mut())
+    {
+        for provider_val in arr.iter_mut() {
+            let provider_id = provider_val
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if provider_id.is_empty() {
+                continue;
+            }
+            let has_key_in_settings = provider_val.get("api_key").is_some();
+            if has_key_in_settings {
+                continue;
+            }
+            let secret_name = custom_secret_name(&provider_id);
+            if secrets.exists(user_id, &secret_name).await.unwrap_or(false)
+                && let Some(o) = provider_val.as_object_mut()
+            {
+                o.insert(
+                    "api_key".to_string(),
+                    serde_json::Value::String(API_KEY_UNCHANGED.to_string()),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_mask_settings_api_keys_builtin_overrides() {
+        let mut settings = HashMap::new();
+        settings.insert(
+            "llm_builtin_overrides".to_string(),
+            serde_json::json!({
+                "openai": { "api_key": "sk-secret-123", "model": "gpt-4" },
+                "anthropic": { "model": "claude-3" }
+            }),
+        );
+
+        mask_settings_api_keys(&mut settings);
+
+        let overrides = settings["llm_builtin_overrides"].as_object().unwrap();
+        assert_eq!(
+            overrides["openai"]["api_key"].as_str().unwrap(),
+            API_KEY_UNCHANGED,
+        );
+        assert_eq!(overrides["openai"]["model"].as_str().unwrap(), "gpt-4");
+        assert!(overrides["anthropic"].get("api_key").is_none());
+    }
+
+    #[test]
+    fn test_mask_settings_api_keys_custom_providers() {
+        let mut settings = HashMap::new();
+        settings.insert(
+            "llm_custom_providers".to_string(),
+            serde_json::json!([
+                { "id": "my-llm", "api_key": "secret-key", "adapter": "open_ai_completions" },
+                { "id": "no-key", "adapter": "ollama" }
+            ]),
+        );
+
+        mask_settings_api_keys(&mut settings);
+
+        let providers = settings["llm_custom_providers"].as_array().unwrap();
+        assert_eq!(providers[0]["api_key"].as_str().unwrap(), API_KEY_UNCHANGED,);
+        assert!(providers[1].get("api_key").is_none());
+    }
+
+    #[test]
+    fn test_mask_settings_no_llm_keys_is_noop() {
+        let mut settings = HashMap::new();
+        settings.insert("some_other_setting".to_string(), serde_json::json!("value"));
+
+        mask_settings_api_keys(&mut settings);
+
+        assert_eq!(settings["some_other_setting"].as_str().unwrap(), "value");
+    }
+
+    #[test]
+    fn test_builtin_secret_name_format() {
+        assert_eq!(builtin_secret_name("openai"), "llm_builtin_openai_api_key");
+    }
+
+    #[test]
+    fn test_custom_secret_name_format() {
+        assert_eq!(custom_secret_name("my-groq"), "llm_custom_my-groq_api_key");
+    }
+
+    fn test_secrets_store() -> Arc<dyn SecretsStore + Send + Sync> {
+        let crypto = Arc::new(
+            crate::secrets::SecretsCrypto::new(secrecy::SecretString::from(
+                crate::secrets::keychain::generate_master_key_hex(),
+            ))
+            .unwrap(),
+        );
+        Arc::new(crate::secrets::InMemorySecretsStore::new(crypto))
+    }
+
+    fn test_gateway_state(secrets: Arc<dyn SecretsStore + Send + Sync>) -> GatewayState {
+        GatewayState {
+            msg_tx: tokio::sync::RwLock::new(None),
+            sse: Arc::new(crate::channels::web::sse::SseManager::new()),
+            workspace: None,
+            workspace_pool: None,
+            session_manager: None,
+            log_broadcaster: None,
+            log_level_handle: None,
+            extension_manager: None,
+            tool_registry: None,
+            store: None,
+            job_manager: None,
+            prompt_queue: None,
+            scheduler: None,
+            default_user_id: "test".to_string(),
+            shutdown_tx: tokio::sync::RwLock::new(None),
+            ws_tracker: None,
+            llm_provider: None,
+            skill_registry: None,
+            skill_catalog: None,
+            chat_rate_limiter: crate::channels::web::server::PerUserRateLimiter::new(30, 60),
+            oauth_rate_limiter: crate::channels::web::server::RateLimiter::new(10, 60),
+            webhook_rate_limiter: crate::channels::web::server::RateLimiter::new(10, 60),
+            registry_entries: Vec::new(),
+            cost_guard: None,
+            routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
+            startup_time: std::time::Instant::now(),
+            active_config: crate::channels::web::server::ActiveConfigSnapshot::default(),
+            secrets_store: Some(secrets),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_extract_builtin_keys_vaults_and_strips() {
+        let secrets = test_secrets_store();
+        let state = test_gateway_state(Arc::clone(&secrets));
+
+        let input = serde_json::json!({
+            "openai": { "api_key": "sk-test-key", "model": "gpt-4" },
+            "anthropic": { "model": "claude-3" }
+        });
+
+        let result = extract_builtin_override_keys(&state, "test", &input)
+            .await
+            .unwrap();
+
+        let obj = result.as_object().unwrap();
+        assert!(
+            obj["openai"].get("api_key").is_none(),
+            "api_key should be stripped"
+        );
+        assert_eq!(obj["openai"]["model"].as_str().unwrap(), "gpt-4");
+        assert_eq!(obj["anthropic"]["model"].as_str().unwrap(), "claude-3");
+
+        let decrypted = secrets
+            .get_decrypted("test", "llm_builtin_openai_api_key")
+            .await
+            .unwrap();
+        assert_eq!(decrypted.expose(), "sk-test-key");
+    }
+
+    #[tokio::test]
+    async fn test_extract_custom_keys_vaults_and_strips() {
+        let secrets = test_secrets_store();
+        let state = test_gateway_state(Arc::clone(&secrets));
+
+        let input = serde_json::json!([
+            { "id": "my-llm", "api_key": "gsk-custom-key", "adapter": "open_ai_completions" },
+            { "id": "local", "adapter": "ollama" }
+        ]);
+
+        let result = extract_custom_provider_keys(&state, "test", &input)
+            .await
+            .unwrap();
+
+        let arr = result.as_array().unwrap();
+        assert!(
+            arr[0].get("api_key").is_none(),
+            "api_key should be stripped"
+        );
+        assert_eq!(arr[0]["id"].as_str().unwrap(), "my-llm");
+        assert!(arr[1].get("api_key").is_none());
+
+        let decrypted = secrets
+            .get_decrypted("test", "llm_custom_my-llm_api_key")
+            .await
+            .unwrap();
+        assert_eq!(decrypted.expose(), "gsk-custom-key");
+    }
+
+    #[tokio::test]
+    async fn test_unchanged_sentinel_preserves_existing_secret() {
+        let secrets = test_secrets_store();
+
+        secrets
+            .create(
+                "test",
+                CreateSecretParams {
+                    name: "llm_builtin_openai_api_key".to_string(),
+                    value: SecretString::from("sk-original".to_string()),
+                    provider: Some("openai".to_string()),
+                    expires_at: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let state = test_gateway_state(Arc::clone(&secrets));
+
+        let input = serde_json::json!({
+            "openai": { "api_key": "••••••••", "model": "gpt-4" }
+        });
+
+        let result = extract_builtin_override_keys(&state, "test", &input)
+            .await
+            .unwrap();
+
+        assert!(result["openai"].get("api_key").is_none());
+
+        let decrypted = secrets
+            .get_decrypted("test", "llm_builtin_openai_api_key")
+            .await
+            .unwrap();
+        assert_eq!(decrypted.expose(), "sk-original");
+    }
 }

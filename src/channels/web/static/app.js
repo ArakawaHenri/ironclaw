@@ -6374,7 +6374,14 @@ function editCustomProvider(id) {
   idField.style.opacity = '0.6';
   document.getElementById('provider-adapter').value = p.adapter || 'open_ai_completions';
   document.getElementById('provider-base-url').value = p.base_url || '';
-  document.getElementById('provider-api-key').value = p.api_key || '';
+  const editApiKeyInput = document.getElementById('provider-api-key');
+  if (p.api_key === '••••••••') {
+    editApiKeyInput.value = '';
+    editApiKeyInput.placeholder = 'Key configured (leave blank to keep)';
+  } else {
+    editApiKeyInput.value = '';
+    editApiKeyInput.placeholder = 'Enter API key';
+  }
   document.getElementById('provider-model').value = p.default_model || '';
   openProviderDialog(true);
   document.getElementById('provider-name').focus();
@@ -6404,8 +6411,16 @@ function configureBuiltinProvider(id) {
   document.getElementById('provider-api-key-row').style.display = p.api_key_required !== false ? '' : 'none';
   document.getElementById('fetch-models-btn').style.display = p.can_list_models ? '' : 'none';
   const apiKeyInput = document.getElementById('provider-api-key');
-  apiKeyInput.value = override.api_key || envDef.api_key || '';
-  apiKeyInput.placeholder = '';
+  const hasDbKey = override.api_key === '••••••••';
+  const hasEnvKey = envDef.has_api_key === true;
+  apiKeyInput.value = '';
+  if (hasDbKey) {
+    apiKeyInput.placeholder = 'Key configured (leave blank to keep)';
+  } else if (hasEnvKey) {
+    apiKeyInput.placeholder = 'Key set via environment variable';
+  } else {
+    apiKeyInput.placeholder = 'Enter API key';
+  }
   document.getElementById('provider-model').value = override.model || envDef.model || p.default_model || '';
   openProviderDialog(true);
   document.getElementById('provider-model').focus();
@@ -6495,8 +6510,15 @@ document.getElementById('save-provider-btn').addEventListener('click', () => {
     const model = document.getElementById('provider-model').value.trim();
     const baseUrl = document.getElementById('provider-base-url').value.trim();
     const id = _configuringBuiltinId;
+    const prevOverride = _builtinOverrides[id] || {};
+    const hadKey = prevOverride.api_key === '••••••••';
     const override = {};
-    if (apiKey) override.api_key = apiKey;
+    if (apiKey) {
+      override.api_key = apiKey;  // New key entered — backend will encrypt it
+    } else if (hadKey) {
+      override.api_key = '••••••••';  // Sentinel: keep existing encrypted key
+    }
+    // If neither — key is cleared (no key configured)
     if (model) override.model = model;
     if (baseUrl) override.base_url = baseUrl;
     const prev = _builtinOverrides[id];
@@ -6543,7 +6565,16 @@ document.getElementById('save-provider-btn').addEventListener('click', () => {
     const idx = _customProviders.findIndex((p) => p.id === _editingProviderId);
     if (idx === -1) return;
     const original = _customProviders[idx];
-    _customProviders[idx] = { ...original, name, adapter, base_url: baseUrl, default_model: model || undefined, api_key: apiKey || undefined };
+    const hadCustomKey = original.api_key === '••••••••';
+    let effectiveApiKey;
+    if (apiKey) {
+      effectiveApiKey = apiKey;  // New key — backend will encrypt it
+    } else if (hadCustomKey) {
+      effectiveApiKey = '••••••••';  // Sentinel: keep existing encrypted key
+    } else {
+      effectiveApiKey = undefined;  // No key
+    }
+    _customProviders[idx] = { ...original, name, adapter, base_url: baseUrl, default_model: model || undefined, api_key: effectiveApiKey };
     const isActive = _editingProviderId === _activeLlmBackend;
     const modelUpdate = () => {
       if (!isActive) return Promise.resolve();
