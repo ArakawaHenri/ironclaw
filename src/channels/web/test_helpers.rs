@@ -77,7 +77,6 @@ impl TestGatewayBuilder {
             job_manager: None,
             prompt_queue: None,
             owner_id: self.user_id.clone(),
-            default_sender_id: self.user_id,
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
             llm_provider: self.llm_provider,

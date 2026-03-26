@@ -591,8 +591,7 @@ async fn async_main() -> anyhow::Result<()> {
     let mut gateway_url: Option<String> = None;
     let mut sse_manager: Option<std::sync::Arc<ironclaw::channels::web::sse::SseManager>> = None;
     if let Some(ref gw_config) = config.channels.gateway {
-        let mut gw = GatewayChannel::new(gw_config.clone());
-        gw = gw.with_owner_scope(config.owner_id.clone());
+        let mut gw = GatewayChannel::new(gw_config.clone(), config.owner_id.clone());
         gw = gw.with_llm_provider(Arc::clone(&components.llm));
         if let Some(ref ws) = components.workspace {
             gw = gw.with_workspace(Arc::clone(ws));
@@ -641,9 +640,9 @@ async fn async_main() -> anyhow::Result<()> {
             if let Ok(false) = d.has_any_users().await {
                 let now = chrono::Utc::now();
                 let user = ironclaw::db::UserRecord {
-                    id: gw_config.user_id.clone(),
+                    id: config.owner_id.clone(),
                     email: None,
-                    display_name: gw_config.user_id.clone(),
+                    display_name: config.owner_id.clone(),
                     status: "active".to_string(),
                     role: "admin".to_string(),
                     created_at: now,
@@ -667,14 +666,14 @@ async fn async_main() -> anyhow::Result<()> {
                             auth_token
                         };
                         if let Err(e) = d
-                            .create_api_token(&gw_config.user_id, "bootstrap", &hash, prefix, None)
+                            .create_api_token(&config.owner_id, "bootstrap", &hash, prefix, None)
                             .await
                         {
                             tracing::warn!("Failed to create bootstrap token: {}", e);
                         }
                     }
                     tracing::info!(
-                        user_id = gw_config.user_id,
+                        user_id = config.owner_id,
                         "Bootstrapped admin user from gateway config"
                     );
                 }
@@ -820,12 +819,7 @@ async fn async_main() -> anyhow::Result<()> {
         .await;
 
     // Default user ID for extension operations (single-user mode).
-    let ext_user_id = config
-        .channels
-        .gateway
-        .as_ref()
-        .map(|g| g.user_id.clone())
-        .unwrap_or_else(|| "default".to_string());
+    let ext_user_id = config.owner_id.clone();
 
     // Wire up channel runtime for hot-activation of WASM channels.
     if let Some(ref ext_mgr) = components.extension_manager

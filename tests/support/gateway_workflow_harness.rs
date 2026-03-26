@@ -227,7 +227,6 @@ impl GatewayWorkflowHarness {
             prompt_queue: None,
             scheduler: Some(scheduler_slot.clone()),
             owner_id: user_id.clone(),
-            default_sender_id: user_id.clone(),
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
             llm_provider: Some(Arc::clone(&components.llm)),

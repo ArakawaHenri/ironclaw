@@ -43,7 +43,6 @@ pub struct GatewayConfig {
     pub port: u16,
     /// Bearer token for authentication. Random hex generated at startup if unset.
     pub auth_token: Option<String>,
-    pub user_id: String,
     /// Additional user scopes for workspace reads.
     ///
     /// When set, the workspace will be able to read (search, read, list) from
@@ -118,10 +117,6 @@ impl ChannelsConfig {
 
         let gateway_enabled = parse_bool_env("GATEWAY_ENABLED", cs.gateway_enabled)?;
         let gateway = if gateway_enabled {
-            let user_id = optional_env("GATEWAY_USER_ID")?
-                .or_else(|| cs.gateway_user_id.clone())
-                .unwrap_or_else(|| owner_id.to_string());
-
             let memory_layers: Vec<crate::workspace::layer::MemoryLayer> =
                 match optional_env("MEMORY_LAYERS")? {
                     Some(json_str) => {
@@ -130,7 +125,7 @@ impl ChannelsConfig {
                             message: format!("must be valid JSON array of layer objects: {e}"),
                         })?
                     }
-                    None => crate::workspace::layer::MemoryLayer::default_for_user(&user_id),
+                    None => crate::workspace::layer::MemoryLayer::default_for_user(owner_id),
                 };
 
             // Validate layer names and scopes
@@ -209,7 +204,6 @@ impl ChannelsConfig {
                 )?,
                 auth_token: optional_env("GATEWAY_AUTH_TOKEN")?
                     .or_else(|| cs.gateway_auth_token.clone()),
-                user_id,
                 workspace_read_scopes,
                 memory_layers,
             })
@@ -366,14 +360,12 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 3000,
             auth_token: Some("tok-abc".to_string()),
-            user_id: "default".to_string(),
             workspace_read_scopes: vec![],
             memory_layers: vec![],
         };
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 3000);
         assert_eq!(cfg.auth_token.as_deref(), Some("tok-abc"));
-        assert_eq!(cfg.user_id, "default");
     }
 
     #[test]
@@ -382,7 +374,6 @@ mod tests {
             host: "0.0.0.0".to_string(),
             port: 3001,
             auth_token: None,
-            user_id: "anon".to_string(),
             workspace_read_scopes: vec![],
             memory_layers: vec![],
         };
@@ -511,7 +502,6 @@ mod tests {
         assert_eq!(gateway.host, "127.0.0.3");
         assert_eq!(gateway.port, 9191);
         assert_eq!(gateway.auth_token.as_deref(), Some("tok"));
-        assert_eq!(gateway.user_id, "owner-scope");
 
         let signal = cfg.signal.expect("signal config");
         assert_eq!(signal.account, "+15551234567");

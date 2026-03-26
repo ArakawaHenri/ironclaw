@@ -205,7 +205,6 @@ async fn start_test_server_with_provider(
         prompt_queue: None,
         scheduler: None,
         owner_id: "test-user".to_string(),
-        default_sender_id: "test-user".to_string(),
         shutdown_tx: tokio::sync::RwLock::new(None),
         ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
         llm_provider: Some(llm_provider),
@@ -705,7 +704,6 @@ async fn test_no_llm_provider_returns_503() {
         prompt_queue: None,
         scheduler: None,
         owner_id: "test-user".to_string(),
-        default_sender_id: "test-user".to_string(),
         shutdown_tx: tokio::sync::RwLock::new(None),
         ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
         llm_provider: None, // No LLM!

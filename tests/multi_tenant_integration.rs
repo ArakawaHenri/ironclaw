@@ -42,8 +42,6 @@ const ALICE_USER_ID: &str = "alice";
 const BOB_USER_ID: &str = "bob";
 const OWNER_TOKEN: &str = "tok-owner-secret";
 const OWNER_SCOPE_ID: &str = "owner-scope";
-const GATEWAY_SENDER_ID: &str = "gateway-sender";
-
 /// Build a MultiAuthState with two users.
 fn two_user_auth() -> MultiAuthState {
     let mut tokens = HashMap::new();
@@ -549,7 +547,6 @@ fn gateway_state_has_multi_tenant_fields() {
         prompt_queue: None,
         scheduler: None,
         owner_id: "fallback".to_string(),
-        default_sender_id: "fallback".to_string(),
         shutdown_tx: tokio::sync::RwLock::new(None),
         ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
         llm_provider: None,
@@ -567,7 +564,6 @@ fn gateway_state_has_multi_tenant_fields() {
     };
 
     assert_eq!(state.owner_id, "fallback");
-    assert_eq!(state.default_sender_id, "fallback");
     assert!(state.workspace_pool.is_none());
 }
 
@@ -626,7 +622,6 @@ async fn start_owner_scoped_sender_server() -> (
         prompt_queue: None,
         scheduler: None,
         owner_id: OWNER_SCOPE_ID.to_string(),
-        default_sender_id: GATEWAY_SENDER_ID.to_string(),
         shutdown_tx: tokio::sync::RwLock::new(None),
         ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
         llm_provider: None,
@@ -778,7 +773,7 @@ async fn full_server_chat_send_rewrites_sender_only_for_owner_scope_rebind() {
         .expect("Timed out waiting for owner message")
         .expect("Agent channel closed");
     assert_eq!(owner_msg.user_id, OWNER_SCOPE_ID);
-    assert_eq!(owner_msg.sender_id, GATEWAY_SENDER_ID);
+    assert_eq!(owner_msg.sender_id, OWNER_SCOPE_ID);
     assert_eq!(owner_msg.content, "hello from owner");
 
     let other_resp = client
@@ -1012,7 +1007,6 @@ async fn start_multi_user_server_with_db() -> (
         prompt_queue: None,
         scheduler: None,
         owner_id: ALICE_USER_ID.to_string(),
-        default_sender_id: ALICE_USER_ID.to_string(),
         shutdown_tx: tokio::sync::RwLock::new(None),
         ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
         llm_provider: None,

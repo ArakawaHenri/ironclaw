@@ -48,7 +48,6 @@ pub async fn users_create_handler(
         ));
     }
 
-    tracing::info!("users_create: passed validation, building record");
     let user_id = Uuid::new_v4().to_string();
 
     let now = chrono::Utc::now();
@@ -68,15 +67,10 @@ pub async fn users_create_handler(
         metadata: serde_json::json!({}),
     };
 
-    tracing::info!("users_create: calling create_user for {}", user_id);
     store
         .create_user(&user_record)
         .await
-        .map_err(|e| {
-            tracing::error!("users_create: create_user failed: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
-    tracing::info!("users_create: create_user succeeded");
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Generate a first API token so the new user can authenticate immediately.
     // Hash the hex-encoded plaintext (what the user sends as Bearer token),
@@ -87,15 +81,10 @@ pub async fn users_create_handler(
     let token_hash = crate::channels::web::auth::hash_token(&plaintext_token);
     let token_prefix = &plaintext_token[..8];
 
-    tracing::info!("users_create: calling create_api_token");
     let _token_record = store
         .create_api_token(&user_id, "initial", &token_hash, token_prefix, None)
         .await
-        .map_err(|e| {
-            tracing::error!("users_create: create_api_token failed: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
-    tracing::info!("users_create: complete, returning response");
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "id": user_record.id,
