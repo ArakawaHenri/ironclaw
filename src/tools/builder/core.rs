@@ -59,7 +59,7 @@ fn process_builder_tool_result(
             })
         });
 
-    crate::tools::execute::process_tool_result(&*SAFETY, tool_name, tool_call_id, result)
+    crate::tools::execute::process_tool_result(&SAFETY, tool_name, tool_call_id, result)
 }
 
 /// Requirement specification for building software.
