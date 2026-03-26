@@ -16,7 +16,7 @@ use axum::{
         IntoResponse,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -378,6 +378,8 @@ pub struct GatewayState {
     pub startup_time: std::time::Instant,
     /// Snapshot of active (resolved) configuration for the frontend.
     pub active_config: ActiveConfigSnapshot,
+    /// Secrets store for admin secret provisioning.
+    pub secrets_store: Option<Arc<dyn crate::secrets::SecretsStore + Send + Sync>>,
 }
 
 /// Start the gateway HTTP server.
@@ -531,6 +533,16 @@ pub async fn start_server(
         .route(
             "/api/admin/users/{id}/activate",
             post(super::handlers::users::users_activate_handler),
+        )
+        // Admin secrets provisioning (per-user)
+        .route(
+            "/api/admin/users/{user_id}/secrets",
+            get(super::handlers::secrets::secrets_list_handler),
+        )
+        .route(
+            "/api/admin/users/{user_id}/secrets/{name}",
+            put(super::handlers::secrets::secrets_put_handler)
+                .delete(super::handlers::secrets::secrets_delete_handler),
         )
         // Usage reporting (admin)
         .route(
@@ -3041,6 +3053,7 @@ mod tests {
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
             startup_time: std::time::Instant::now(),
             active_config: ActiveConfigSnapshot::default(),
+            secrets_store: None,
         })
     }
 

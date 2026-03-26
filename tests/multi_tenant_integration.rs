@@ -563,6 +563,7 @@ fn gateway_state_has_multi_tenant_fields() {
         startup_time: std::time::Instant::now(),
         webhook_rate_limiter: RateLimiter::new(10, 60),
         active_config: Default::default(),
+        secrets_store: None,
     };
 
     assert_eq!(state.owner_id, "fallback");
@@ -639,6 +640,7 @@ async fn start_owner_scoped_sender_server() -> (
         routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
         startup_time: std::time::Instant::now(),
         active_config: Default::default(),
+        secrets_store: None,
     });
 
     let auth = MultiAuthState::multi(tokens).into();
@@ -1024,6 +1026,7 @@ async fn start_multi_user_server_with_db() -> (
         startup_time: std::time::Instant::now(),
         webhook_rate_limiter: RateLimiter::new(10, 60),
         active_config: Default::default(),
+        secrets_store: None,
     });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();

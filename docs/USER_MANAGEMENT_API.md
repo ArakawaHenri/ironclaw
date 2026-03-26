@@ -1,6 +1,6 @@
 # User Management API
 
-DB-backed user management for multi-tenant IronClaw deployments. Covers admin user CRUD, self-service profile, API token management, and usage reporting.
+DB-backed user management for multi-tenant IronClaw deployments. Covers admin user CRUD, per-user secrets provisioning, self-service profile, API token management, and usage reporting.
 
 ## Authentication
 
@@ -208,6 +208,113 @@ Permanently delete a user and all associated data (tokens, jobs, conversations, 
 
 ---
 
+## Admin: Per-User Secrets
+
+Provision secrets on behalf of individual users. The primary use case is an application backend (acting as admin) that configures per-user credentials so each user's IronClaw agent can call back to external services.
+
+Secrets are encrypted at rest with AES-256-GCM using a per-secret HKDF-derived key. Plaintext values are **never returned** by any endpoint — they can only be used by the agent's tool system at runtime.
+
+### PUT /api/admin/users/{user_id}/secrets/{name}
+
+Create or update a secret for the specified user. If a secret with the same name already exists, it is overwritten.
+
+**Auth:** Admin
+
+**Path parameters:**
+
+| Param | Type | Notes |
+|-------|------|-------|
+| `user_id` | string | The user's ID |
+| `name` | string | Secret name (normalized to lowercase) |
+
+**Request body:**
+
+```json
+{
+  "value": "sk-live-abc123...",
+  "provider": "my-app-backend",
+  "expires_in_days": 90
+}
+```
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `value` | string | yes | The secret value (encrypted at rest, never returned) |
+| `provider` | string | no | Tag for grouping (e.g. `"stripe"`, `"my-app"`) |
+| `expires_in_days` | integer | no | Auto-expire after N days; `null` = never |
+
+**Response:** `200 OK`
+
+```json
+{
+  "user_id": "550e8400-...",
+  "name": "my_app_callback_token",
+  "status": "created"
+}
+```
+
+**Errors:** `400` (missing value), `403` (not admin), `503` (secrets store not available)
+
+**Example — application backend provisioning a callback token:**
+
+```bash
+# Admin creates a user
+curl -X POST https://ironclaw.example.com/api/admin/users \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"display_name": "Alice", "role": "member"}'
+# Response includes: {"id": "alice-uuid", "token": "alice-bearer-token", ...}
+
+# Admin provisions a per-user callback secret
+curl -X PUT https://ironclaw.example.com/api/admin/users/alice-uuid/secrets/app_callback_token \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"value": "per-user-jwt-for-alice", "provider": "my-app"}'
+
+# Now Alice's IronClaw agent can use the "app_callback_token" secret
+# when calling tools that need to authenticate back to the app backend.
+```
+
+---
+
+### GET /api/admin/users/{user_id}/secrets
+
+List a user's secrets. Returns names and providers only — **never values or hashes**.
+
+**Auth:** Admin
+
+**Response:** `200 OK`
+
+```json
+{
+  "user_id": "550e8400-...",
+  "secrets": [
+    {"name": "app_callback_token", "provider": "my-app"},
+    {"name": "openai_api_key", "provider": "openai"}
+  ]
+}
+```
+
+---
+
+### DELETE /api/admin/users/{user_id}/secrets/{name}
+
+Delete a specific secret for a user.
+
+**Auth:** Admin
+
+**Response:** `200 OK`
+
+```json
+{
+  "user_id": "550e8400-...",
+  "name": "app_callback_token",
+  "deleted": true
+}
+```
+
+**Errors:** `404` (secret not found), `403` (not admin), `503` (secrets store not available)
+
+---
+
 ## Admin: Usage
 
 ### GET /api/admin/usage
@@ -393,8 +500,26 @@ All error responses return a plain text body with the error message and the corr
 | `401` | Missing or invalid bearer token |
 | `403` | Authenticated but insufficient role (member accessing admin endpoint) |
 | `404` | Resource not found |
-| `503` | Database not available |
+| `503` | Database or secrets store not available |
 | `500` | Internal server error |
+
+---
+
+## Security Model
+
+### Secrets Encryption
+
+- **Algorithm:** AES-256-GCM with per-secret HKDF-SHA256 derived keys
+- **Master key:** 32+ bytes, resolved from `SECRETS_MASTER_KEY` env var or OS keychain
+- **Storage format:** `nonce (12B) || ciphertext || tag (16B)` in `encrypted_value` column
+- **Per-secret salt:** 32 random bytes stored alongside the ciphertext
+- **Zero-exposure:** Plaintext never appears in logs, debug output, API responses, or LLM conversations
+
+### Auth Cache
+
+- Bounded LRU cache (1024 entries max)
+- 60-second TTL per entry
+- Suspending a user or revoking a token takes up to 60s to propagate
 
 ---
 
@@ -420,7 +545,7 @@ All error responses return a plain text body with the error message and the corr
 | Column | Type (PG / libSQL) | Notes |
 |--------|--------------------|-------|
 | `id` | `UUID` / `TEXT` | Primary key |
-| `user_id` | `TEXT NOT NULL` | FK to `users.id` (PG cascades; libSQL uses explicit cleanup) |
+| `user_id` | `TEXT NOT NULL` | FK to `users.id` (PG cascades; libSQL explicit cleanup) |
 | `token_hash` | `BYTEA` / `BLOB` | SHA-256 of hex-encoded plaintext |
 | `token_prefix` | `TEXT NOT NULL` | First 8 chars for identification |
 | `name` | `TEXT NOT NULL` | Human-readable label |
@@ -428,3 +553,19 @@ All error responses return a plain text body with the error message and the corr
 | `last_used_at` | `TIMESTAMPTZ` / `TEXT` | Nullable |
 | `created_at` | `TIMESTAMPTZ` / `TEXT` | |
 | `revoked_at` | `TIMESTAMPTZ` / `TEXT` | Nullable; set on revocation |
+
+### secrets
+
+| Column | Type (PG / libSQL) | Notes |
+|--------|--------------------|-------|
+| `id` | `UUID` / `TEXT` | Primary key |
+| `user_id` | `TEXT NOT NULL` | Scoped to user |
+| `name` | `TEXT NOT NULL` | Unique per user (lowercase normalized) |
+| `encrypted_value` | `BYTEA` / `BLOB` | AES-256-GCM (nonce + ciphertext + tag) |
+| `key_salt` | `BYTEA` / `BLOB` | Per-secret HKDF salt |
+| `provider` | `TEXT` | Optional grouping tag |
+| `expires_at` | `TIMESTAMPTZ` / `TEXT` | Nullable |
+| `last_used_at` | `TIMESTAMPTZ` / `TEXT` | Audit: last injection time |
+| `usage_count` | `BIGINT` / `INTEGER` | Audit: total injections |
+| `created_at` | `TIMESTAMPTZ` / `TEXT` | |
+| `updated_at` | `TIMESTAMPTZ` / `TEXT` | |

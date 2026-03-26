@@ -632,6 +632,9 @@ async fn async_main() -> anyhow::Result<()> {
         if let Some(ref d) = components.db {
             gw = gw.with_store(Arc::clone(d));
             gw = gw.with_db_auth(Arc::clone(d));
+            if let Some(ref ss) = components.secrets_store {
+                gw = gw.with_secrets_store(Arc::clone(ss));
+            }
 
             // Bootstrap: create the first admin user from single-user config
             // so the owner appears in the Users admin panel immediately.

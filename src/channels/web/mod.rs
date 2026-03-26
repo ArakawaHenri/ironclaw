@@ -116,6 +116,7 @@ impl GatewayChannel {
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
             startup_time: std::time::Instant::now(),
             active_config: server::ActiveConfigSnapshot::default(),
+            secrets_store: None,
         });
 
         Self {
@@ -169,6 +170,7 @@ impl GatewayChannel {
             routine_engine: Arc::clone(&self.state.routine_engine),
             startup_time: self.state.startup_time,
             active_config: self.state.active_config.clone(),
+            secrets_store: self.state.secrets_store.clone(),
         };
         mutate(&mut new_state);
         self.state = Arc::new(new_state);
@@ -289,6 +291,15 @@ impl GatewayChannel {
     /// Inject the active (resolved) configuration snapshot for the status endpoint.
     pub fn with_active_config(mut self, config: server::ActiveConfigSnapshot) -> Self {
         self.rebuild_state(|s| s.active_config = config);
+        self
+    }
+
+    /// Inject the secrets store for admin secret provisioning.
+    pub fn with_secrets_store(
+        mut self,
+        store: Arc<dyn crate::secrets::SecretsStore + Send + Sync>,
+    ) -> Self {
+        self.rebuild_state(|s| s.secrets_store = Some(store));
         self
     }
 
