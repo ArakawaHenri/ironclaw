@@ -6486,12 +6486,21 @@ document.getElementById('test-provider-btn').addEventListener('click', () => {
   // Resolve provider_id so the backend can look up vaulted API keys.
   const providerId = _configuringBuiltinId || document.getElementById('provider-id').value.trim();
 
+  if (!model) {
+    result.textContent = I18n.t('config.modelRequired') || 'Model is required for connection test';
+    result.className = 'test-connection-result test-fail';
+    result.style.display = '';
+    btn.disabled = false;
+    btn.textContent = I18n.t('config.testConnection');
+    return;
+  }
+
   apiFetch('/api/llm/test_connection', {
     method: 'POST',
     body: {
       adapter, base_url: baseUrl,
       api_key: apiKey || undefined,
-      model: model || undefined,
+      model,
       provider_id: providerId || undefined,
       provider_type: _configuringBuiltinId ? 'builtin' : 'custom',
     },
@@ -6547,7 +6556,9 @@ document.getElementById('save-provider-btn').addEventListener('click', () => {
         renderProviders();
         resetProviderForm();
         scrollToProviders();
-        document.getElementById('config-restart-notice').style.display = 'flex';
+        if (isActive) {
+          document.getElementById('config-restart-notice').style.display = 'flex';
+        }
         showToast(I18n.t('config.providerConfigured', { name: id }));
       })
       .catch((e) => {
@@ -6597,7 +6608,9 @@ document.getElementById('save-provider-btn').addEventListener('click', () => {
       renderProviders();
       resetProviderForm();
       scrollToProviders();
-      document.getElementById('config-restart-notice').style.display = 'flex';
+      if (isActive) {
+        document.getElementById('config-restart-notice').style.display = 'flex';
+      }
       showToast(I18n.t('config.providerUpdated', { name }));
     }).catch((e) => {
       _customProviders[idx] = original;
@@ -6623,7 +6636,6 @@ document.getElementById('save-provider-btn').addEventListener('click', () => {
     renderProviders();
     resetProviderForm();
     scrollToProviders();
-    document.getElementById('config-restart-notice').style.display = 'flex';
     showToast(I18n.t('config.providerAdded', { name }));
   }).catch((e) => {
     _customProviders.pop();

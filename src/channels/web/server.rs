@@ -2619,6 +2619,8 @@ async fn routines_runs_handler(
 struct TestConnectionRequest {
     adapter: String,
     base_url: String,
+    /// Model to use for the test chat completion request.
+    model: String,
     #[serde(default)]
     api_key: Option<String>,
     /// Provider identifier used to look up the vaulted API key when `api_key`
@@ -2628,11 +2630,6 @@ struct TestConnectionRequest {
     /// `"builtin"` or `"custom"` — determines the secret name prefix.
     #[serde(default)]
     provider_type: Option<String>,
-    /// Accepted for backward compatibility with frontends that still send it,
-    /// but no longer used since test_connection switched to `GET /models`.
-    #[serde(default)]
-    #[allow(dead_code)]
-    model: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -2705,8 +2702,15 @@ async fn test_provider_connection(req: TestConnectionRequest) -> TestConnectionR
         };
     }
 
+    if req.model.trim().is_empty() {
+        return TestConnectionResponse {
+            ok: false,
+            message: "Model is required for connection test".to_string(),
+        };
+    }
+
     let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
     {
         Ok(c) => c,
@@ -2721,73 +2725,51 @@ async fn test_provider_connection(req: TestConnectionRequest) -> TestConnectionR
     let base = req.base_url.trim_end_matches('/');
 
     match req.adapter.as_str() {
-        "nearai" if is_nearai_private_endpoint(base) => {
-            // NEAR AI private endpoints use /health for connectivity checks.
-            let url = format!("{base}/health");
-            let mut builder = client.get(&url);
-            if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
-                builder = builder.header("Authorization", format!("Bearer {key}"));
-            }
-            match builder.send().await {
-                Ok(r) if r.status().is_success() => TestConnectionResponse {
-                    ok: true,
-                    message: format!("Connected ({})", r.status()),
-                },
-                Ok(r)
-                    if r.status() == reqwest::StatusCode::UNAUTHORIZED
-                        || r.status() == reqwest::StatusCode::FORBIDDEN =>
-                {
-                    TestConnectionResponse {
-                        ok: false,
-                        message: format!("Authentication failed ({})", r.status()),
-                    }
-                }
-                Ok(r) => TestConnectionResponse {
-                    ok: false,
-                    message: format!("Server returned {}", r.status()),
-                },
-                Err(e) => TestConnectionResponse {
-                    ok: false,
-                    message: format!("Connection failed: {e}"),
-                },
-            }
-        }
-        "ollama" => {
-            let url = format!("{base}/api/tags");
-            match client.get(&url).send().await {
-                Ok(r) if r.status().is_success() => TestConnectionResponse {
-                    ok: true,
-                    message: format!("Connected ({})", r.status()),
-                },
-                Ok(r) => TestConnectionResponse {
-                    ok: false,
-                    message: format!("Server returned {}", r.status()),
-                },
-                Err(e) => TestConnectionResponse {
-                    ok: false,
-                    message: format!("Connection failed: {e}"),
-                },
-            }
-        }
         "anthropic" => {
-            // Use GET /v1/models to verify connectivity + auth without consuming tokens.
             let anthropic_base = if base.ends_with("/v1") || base.contains("/v1/") {
                 base.to_string()
             } else {
                 format!("{base}/v1")
             };
-            let url = format!("{anthropic_base}/models");
-            let mut builder = client.get(&url).header("anthropic-version", "2023-06-01");
+            let url = format!("{anthropic_base}/messages");
+            let body = serde_json::json!({
+                "model": req.model,
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            let mut builder = client
+                .post(&url)
+                .header("anthropic-version", "2023-06-01")
+                .json(&body);
             if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
                 builder = builder.header("x-api-key", key);
             }
             interpret_chat_response(builder.send().await)
         }
+        "ollama" => {
+            let url = format!("{base}/api/chat");
+            let body = serde_json::json!({
+                "model": req.model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": false
+            });
+            let builder = client.post(&url).json(&body);
+            interpret_chat_response(builder.send().await)
+        }
         _ => {
-            // OpenAI-compatible: use GET /models to verify connectivity + auth
-            // without consuming tokens (no chat/completions call).
-            let url = format!("{base}/models");
-            let mut builder = client.get(&url);
+            // OpenAI-compatible (including nearai): POST /v1/chat/completions
+            // If base already ends with /v1, append directly; otherwise insert /v1.
+            let chat_url = if base.ends_with("/v1") {
+                format!("{base}/chat/completions")
+            } else {
+                format!("{base}/v1/chat/completions")
+            };
+            let body = serde_json::json!({
+                "model": req.model,
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            let mut builder = client.post(&chat_url).json(&body);
             if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
                 builder = builder.header("Authorization", format!("Bearer {key}"));
             }
