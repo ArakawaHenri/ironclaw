@@ -296,16 +296,14 @@ mod tests {
 
     #[test]
     fn test_truncate_content_multibyte_does_not_panic() {
-        // "cafe\u{0301}" = "café" where é is e + combining accent (2 bytes for accent)
-        // Slicing at byte 5 would land inside the combining character
-        let s = "caf\u{00e9} au lait"; // café = 5 bytes (é is 2 bytes)
-        let result = truncate_content(s, 4); // byte 4 is inside é
-        assert!(result.ends_with("..."));
-        assert!(!result.is_empty());
+        // \u{00e9} is precomposed 'é' (2 bytes in UTF-8)
+        let s = "caf\u{00e9} au lait"; // "café au lait", é starts at byte 3
+        let result = truncate_content(s, 4); // byte 4 is inside 2-byte é
+        assert_eq!(result, "caf...");
 
         // 4-byte emoji: slicing mid-emoji must not panic
-        let emoji = "Hi \u{1F600} there"; // 😀 is 4 bytes
+        let emoji = "Hi \u{1F600} there"; // 😀 is 4 bytes, starts at byte 3
         let result = truncate_content(emoji, 4); // byte 4 is inside 😀
-        assert!(result.ends_with("..."));
+        assert_eq!(result, "Hi ...");
     }
 }
