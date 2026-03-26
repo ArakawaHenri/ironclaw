@@ -49,6 +49,7 @@ pub async fn secrets_put_handler(
     let expires_at = body
         .get("expires_in_days")
         .and_then(|v| v.as_u64())
+        .map(|d| d.min(36500))
         .map(|days| chrono::Utc::now() + chrono::Duration::days(days as i64));
 
     let mut params = CreateSecretParams::new(name.clone(), value);

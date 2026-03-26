@@ -34,7 +34,10 @@ pub async fn tokens_create_handler(
         ))?
         .to_string();
 
-    let expires_in_days = body.get("expires_in_days").and_then(|v| v.as_u64());
+    let expires_in_days = body
+        .get("expires_in_days")
+        .and_then(|v| v.as_u64())
+        .map(|d| d.min(36500));
 
     let expires_at =
         expires_in_days.map(|days| chrono::Utc::now() + chrono::Duration::days(days as i64));
@@ -56,6 +59,18 @@ pub async fn tokens_create_handler(
         .and_then(|v| v.as_str())
         .filter(|_| user.role == "admin")
         .unwrap_or(&user.user_id);
+
+    // Verify the target user exists to prevent orphan tokens.
+    if target_user != user.user_id {
+        store
+            .get_user(target_user)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .ok_or((
+                StatusCode::BAD_REQUEST,
+                format!("Target user '{target_user}' not found"),
+            ))?;
+    }
 
     let record = store
         .create_api_token(target_user, &name, &hash, token_prefix, expires_at)

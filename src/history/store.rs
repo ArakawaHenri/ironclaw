@@ -2540,12 +2540,18 @@ impl Store {
     /// Delete a user and all their data across all user-scoped tables.
     /// Returns false if the user doesn't exist.
     pub async fn delete_user(&self, id: &str) -> Result<bool, DatabaseError> {
-        let conn = self.conn().await?;
+        let mut conn = self.conn().await?;
+        let tx = conn
+            .transaction()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
         // Delete from child tables first to avoid FK violations.
-        // agent_jobs cascades to job_actions, llm_calls, estimation_snapshots
-        // conversations cascades to conversation_messages
-        // memory_documents cascades to memory_chunks
-        // routines cascades to routine_runs
+        // job_events must come before agent_jobs (FK without CASCADE).
+        // agent_jobs cascades to job_actions, llm_calls, estimation_snapshots.
+        // conversations cascades to conversation_messages.
+        // memory_documents cascades to memory_chunks.
+        // routines cascades to routine_runs.
+        // api_tokens cascade automatically via FK on users.
         for table in &[
             "settings",
             "heartbeat_state",
@@ -2556,22 +2562,37 @@ impl Store {
             "wasm_tools",
             "routines",
             "memory_documents",
-            "agent_jobs",
             "conversations",
         ] {
-            conn.execute(&format!("DELETE FROM {} WHERE user_id = $1", table), &[&id])
-                .await?;
+            tx.execute(&format!("DELETE FROM {table} WHERE user_id = $1"), &[&id])
+                .await
+                .map_err(|e| DatabaseError::Query(e.to_string()))?;
         }
+        // job_events references agent_jobs(id) without CASCADE — delete via subquery.
+        tx.execute(
+            "DELETE FROM job_events WHERE job_id IN (SELECT id FROM agent_jobs WHERE user_id = $1)",
+            &[&id],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        tx.execute("DELETE FROM agent_jobs WHERE user_id = $1", &[&id])
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
         // Nullify self-referencing created_by before deleting the user
-        conn.execute(
+        tx.execute(
             "UPDATE users SET created_by = NULL WHERE created_by = $1",
             &[&id],
         )
-        .await?;
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
         // api_tokens cascade automatically via FK
-        let result = conn
+        let result = tx
             .execute("DELETE FROM users WHERE id = $1", &[&id])
-            .await?;
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(result > 0)
     }
 

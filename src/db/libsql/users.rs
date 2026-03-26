@@ -403,7 +403,6 @@ impl UserStore for LibSqlBackend {
             "wasm_tools",
             "routines",
             "memory_documents",
-            "agent_jobs",
             "conversations",
             "api_tokens",
         ] {
@@ -414,6 +413,16 @@ impl UserStore for LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
         }
+        // job_events references agent_jobs(id) without CASCADE — delete via subquery.
+        conn.execute(
+            "DELETE FROM job_events WHERE job_id IN (SELECT id FROM agent_jobs WHERE user_id = ?1)",
+            params![id],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        conn.execute("DELETE FROM agent_jobs WHERE user_id = ?1", params![id])
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
         // Nullify self-referencing created_by before deleting the user
         conn.execute(
             "UPDATE users SET created_by = NULL WHERE created_by = ?1",

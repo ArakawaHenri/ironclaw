@@ -172,7 +172,14 @@ impl DbAuthenticator {
         }
 
         // Cache miss or expired — query DB
-        let (token_record, user_record) = self.store.authenticate_token(&hash).await.ok()??;
+        let (token_record, user_record) = match self.store.authenticate_token(&hash).await {
+            Ok(Some(pair)) => pair,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!(error = %e, "DB auth lookup failed");
+                return None;
+            }
+        };
 
         let identity = UserIdentity {
             user_id: user_record.id.clone(),
