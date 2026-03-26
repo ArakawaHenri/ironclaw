@@ -34,10 +34,16 @@ pub async fn tokens_create_handler(
         ))?
         .to_string();
 
-    let expires_in_days: Option<i64> = body
-        .get("expires_in_days")
-        .and_then(|v| v.as_u64())
-        .map(|d| d.min(36500) as i64);
+    let expires_in_days: Option<i64> = match body.get("expires_in_days").and_then(|v| v.as_u64()) {
+        Some(d) if d > 36500 => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "expires_in_days must not exceed 36500 (100 years)".to_string(),
+            ));
+        }
+        Some(d) => Some(d as i64),
+        None => None,
+    };
 
     let expires_at = expires_in_days.map(|days| chrono::Utc::now() + chrono::Duration::days(days));
 
@@ -66,7 +72,7 @@ pub async fn tokens_create_handler(
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .ok_or((
-                StatusCode::BAD_REQUEST,
+                StatusCode::NOT_FOUND,
                 format!("Target user '{target_user}' not found"),
             ))?;
     }

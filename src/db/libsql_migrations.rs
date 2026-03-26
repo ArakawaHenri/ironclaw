@@ -591,13 +591,13 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     last_login_at TEXT,
-    created_by TEXT,
+    created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
     metadata TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS api_tokens (
     id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     token_hash BLOB NOT NULL,
     token_prefix TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -768,13 +768,13 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     last_login_at TEXT,
-    created_by TEXT,
+    created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
     metadata TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS api_tokens (
     id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     token_hash BLOB NOT NULL,
     token_prefix TEXT NOT NULL,
     name TEXT NOT NULL,

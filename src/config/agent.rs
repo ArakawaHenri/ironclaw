@@ -36,8 +36,7 @@ pub struct AgentConfig {
     /// Maximum tokens per job (0 = unlimited).
     pub max_tokens_per_job: u64,
     /// Whether the deployment is multi-tenant (multiple users sharing one
-    /// instance). Detected at runtime after DB initialization, not from config.
-    /// See app.rs startup logic.
+    /// instance). Defaults to false; can be set via AGENT_MULTI_TENANT env var.
     pub multi_tenant: bool,
     /// Maximum concurrent LLM calls per user. None = use default (4).
     pub max_llm_concurrent_per_user: Option<usize>,
@@ -131,9 +130,7 @@ impl AgentConfig {
                 "AGENT_MAX_TOKENS_PER_JOB",
                 settings.agent.max_tokens_per_job,
             )?,
-            // Multi-tenant mode is detected at runtime after DB initialization,
-            // not from config. See app.rs startup logic.
-            multi_tenant: false,
+            multi_tenant: parse_bool_env("AGENT_MULTI_TENANT", false)?,
             max_llm_concurrent_per_user: parse_option_env("TENANT_MAX_LLM_CONCURRENT")?,
             max_jobs_concurrent_per_user: parse_option_env("TENANT_MAX_JOBS_CONCURRENT")?,
         })

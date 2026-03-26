@@ -60,17 +60,22 @@ pub async fn users_create_handler(
         created_at: now,
         updated_at: now,
         last_login_at: None,
-        created_by: match store.get_user(&user.user_id).await {
-            Ok(Some(_)) => Some(user.user_id.clone()),
-            _ => None,
-        },
+        created_by: Some(user.user_id.clone()),
         metadata: serde_json::json!({}),
     };
 
-    store
-        .create_user(&user_record)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    store.create_user(&user_record).await.map_err(|e| {
+        let msg = e.to_string();
+        let lower = msg.to_ascii_lowercase();
+        if lower.contains("unique")
+            || lower.contains("duplicate")
+            || lower.contains("already exists")
+        {
+            (StatusCode::CONFLICT, msg)
+        } else {
+            (StatusCode::INTERNAL_SERVER_ERROR, msg)
+        }
+    })?;
 
     // Generate a first API token so the new user can authenticate immediately.
     // Hash the hex-encoded plaintext (what the user sends as Bearer token),

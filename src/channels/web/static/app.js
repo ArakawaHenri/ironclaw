@@ -4418,16 +4418,17 @@ function createTokenForUser(userId, displayName) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name: tokenName, user_id: userId }),
   }).then(function(data) {
-    showTokenBanner(data.token);
+    showTokenBanner(data.token, 'Token created!');
   }).catch(function(e) { alert('Failed to create token: ' + e.message); });
 }
 
-function showTokenBanner(tokenValue) {
+function showTokenBanner(tokenValue, title) {
   var banner = document.getElementById('users-token-result');
   if (!banner) return;
+  var heading = title || 'Token created!';
   var loginUrl = window.location.origin + '/?token=' + encodeURIComponent(tokenValue);
   banner.style.display = 'block';
-  banner.innerHTML = '<strong>User created!</strong> Share this login link — it won\'t be shown again:<br>'
+  banner.innerHTML = '<strong>' + escapeHtml(heading) + '</strong> Share this login link — it won\'t be shown again:<br>'
     + '<code class="token-display" id="token-copy-value">' + escapeHtml(loginUrl) + '</code>'
     + '<button class="btn-small" id="token-copy-link">Copy Link</button>'
     + '<br><span style="font-size:0.8em;color:var(--text-muted)">Raw token: ' + escapeHtml(tokenValue) + '</span>';
@@ -4479,7 +4480,7 @@ document.getElementById('users-create-submit')?.addEventListener('click', functi
     document.getElementById('user-display-name').value = '';
     document.getElementById('user-email').value = '';
     if (data.token) {
-      showTokenBanner(data.token);
+      showTokenBanner(data.token, 'User created!');
     }
     loadUsers();
   }).catch(function(e) { alert('Failed to create user: ' + e.message); });

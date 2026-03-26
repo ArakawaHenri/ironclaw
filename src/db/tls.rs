@@ -41,9 +41,7 @@ fn make_rustls_connector() -> Result<MakeRustlsConnect, rustls::Error> {
 
     // Fall back to bundled Mozilla roots when the system store is empty.
     if root_store.is_empty() {
-        tracing::info!(
-            "no system root certificates found, using bundled Mozilla roots"
-        );
+        tracing::info!("no system root certificates found, using bundled Mozilla roots");
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
 

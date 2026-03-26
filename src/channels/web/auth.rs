@@ -180,8 +180,8 @@ impl DbAuthenticator {
             Ok(Some(pair)) => pair,
             Ok(None) => return Ok(None),
             Err(e) => {
-                tracing::error!(error = %e, "DB auth lookup failed, returning 503");
-                return Err(());
+                tracing::warn!("DB auth lookup failed: {e}");
+                return Ok(None);
             }
         };
 
