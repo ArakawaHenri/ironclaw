@@ -407,6 +407,42 @@ pub async fn start_server(
     // Public routes (no auth)
     let public = Router::new()
         .route("/api/health", get(health_handler))
+        .route("/api/debug/db-write", get({
+            let dbg_state = state.clone();
+            move || async move {
+                tracing::info!("debug/db-write: starting");
+                let store = match dbg_state.store.as_ref() {
+                    Some(s) => s,
+                    None => return "ERROR: store is None".to_string(),
+                };
+                tracing::info!("debug/db-write: store is Some, attempting create_user");
+                let id = format!("dbg-{}", uuid::Uuid::new_v4());
+                let now = chrono::Utc::now();
+                let user = crate::db::UserRecord {
+                    id: id.clone(),
+                    email: None,
+                    display_name: "debug-test".to_string(),
+                    status: "active".to_string(),
+                    role: "member".to_string(),
+                    created_at: now,
+                    updated_at: now,
+                    last_login_at: None,
+                    created_by: None,
+                    metadata: serde_json::json!({}),
+                };
+                match store.create_user(&user).await {
+                    Ok(()) => {
+                        tracing::info!("debug/db-write: create_user succeeded");
+                        let _ = store.delete_user(&id).await;
+                        format!("OK: created and deleted user {id}")
+                    }
+                    Err(e) => {
+                        tracing::error!("debug/db-write: create_user failed: {e}");
+                        format!("ERROR: {e}")
+                    }
+                }
+            }
+        }))
         .route("/oauth/callback", get(oauth_callback_handler))
         .route(
             "/oauth/slack/callback",
