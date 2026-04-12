@@ -172,6 +172,15 @@ pub(crate) const SAFE_ENV_VARS: &[&str] = &[
     "TMPDIR",
     "TMP",
     "TEMP",
+    // Network proxy configuration
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
     // XDG (Linux desktop/config paths)
     "XDG_RUNTIME_DIR",
     "XDG_DATA_HOME",
