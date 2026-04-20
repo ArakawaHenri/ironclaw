@@ -356,9 +356,17 @@ pub(crate) async fn chat_events_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Verbose/debug stream is admin-only — non-admin clients silently
+    // get the normal stream so query-param tampering can't leak verbose
+    // events. Matches the AdminUser gate on /api/debug/prompt.
+    let verbose = params.debug && user.role == "admin";
     let sse = state
         .sse
-        .subscribe(Some(user.user_id), extract_last_event_id(&params, &headers))
+        .subscribe(
+            Some(user.user_id),
+            verbose,
+            extract_last_event_id(&params, &headers),
+        )
         .ok_or((
             StatusCode::SERVICE_UNAVAILABLE,
             "Too many connections".to_string(),
@@ -372,6 +380,7 @@ pub(crate) async fn chat_events_handler(
 pub(crate) async fn chat_ws_handler(
     AuthenticatedUser(user): AuthenticatedUser,
     headers: axum::http::HeaderMap,
+    Query(params): Query<ChatEventsQuery>,
     ws: WebSocketUpgrade,
     State(state): State<Arc<GatewayState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -395,8 +404,9 @@ pub(crate) async fn chat_ws_handler(
             "WebSocket origin not allowed".to_string(),
         ));
     }
+    let verbose = params.debug && user.role == "admin";
     Ok(ws.on_upgrade(move |socket| {
-        crate::channels::web::platform::ws::handle_ws_connection(socket, state, user)
+        crate::channels::web::platform::ws::handle_ws_connection(socket, state, user, verbose)
     }))
 }
 
@@ -835,6 +845,8 @@ pub(crate) async fn chat_new_thread_handler(
 
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct ChatEventsQuery {
+    #[serde(default)]
+    pub debug: bool,
     pub last_event_id: Option<String>,
 }
 

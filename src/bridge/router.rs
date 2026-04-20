@@ -6291,7 +6291,7 @@ mod tests {
         let store = Arc::new(TestStore::new());
         let sse = Arc::new(SseManager::new());
         let mut event_stream = Box::pin(
-            sse.subscribe_raw(Some("alice".to_string()))
+            sse.subscribe_raw(Some("alice".to_string()), false)
                 .expect("subscribe raw"),
         );
         let (agent, statuses) = make_router_test_agent(Some(Arc::clone(&sse))).await;
@@ -6361,7 +6361,7 @@ mod tests {
         write_fake_wasm_channel(&wasm_channels_dir, channel_name);
 
         let mut event_stream = Box::pin(
-            sse.subscribe_raw(Some("alice".to_string()))
+            sse.subscribe_raw(Some("alice".to_string()), false)
                 .expect("subscribe raw"),
         );
         let (agent, statuses) = make_router_test_agent(Some(Arc::clone(&sse))).await;
