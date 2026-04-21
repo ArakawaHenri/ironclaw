@@ -133,6 +133,19 @@ impl TenantScope {
         self.inner.get_agent_job_failure_reason(id).await
     }
 
+    /// Fetch the latest persisted terminal result message for an agent job.
+    pub async fn get_agent_job_result_message(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<String>, DatabaseError> {
+        if self.get_job(id).await?.is_none() {
+            return Ok(None);
+        }
+
+        let events = self.inner.list_job_events(id, Some(20)).await?;
+        Ok(crate::history::latest_job_result_message(&events))
+    }
+
     pub async fn update_job_status(
         &self,
         id: Uuid,
@@ -831,6 +844,15 @@ impl SystemScope {
         id: Uuid,
     ) -> Result<Option<String>, DatabaseError> {
         self.inner.get_agent_job_failure_reason(id).await
+    }
+
+    /// Fetch the latest persisted terminal result message for an agent job.
+    pub async fn get_agent_job_result_message(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<String>, DatabaseError> {
+        let events = self.inner.list_job_events(id, Some(20)).await?;
+        Ok(crate::history::latest_job_result_message(&events))
     }
 
     // === LLM call recording ===

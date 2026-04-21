@@ -17,12 +17,12 @@ use crate::tools::builder::{
 };
 use crate::tools::builtin::{
     ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, ExtensionInfoTool, FileUndoTool,
-    GlobTool, GrepTool, HttpTool, JobEventsTool, JobPromptTool, JobStatusTool, JsonTool,
-    ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool,
-    PlanUpdateTool, PromptQueue, ReadFileTool, ShellTool, SkillInstallTool, SkillListTool,
-    SkillRemoveTool, SkillSearchTool, TimeTool, ToolActivateTool, ToolAuthTool, ToolInstallTool,
-    ToolListTool, ToolPermissionSetTool, ToolRemoveTool, ToolSearchTool, ToolUpgradeTool,
-    WriteFileTool, shared_file_history, shared_read_file_state,
+    FinishJobTool, GlobTool, GrepTool, HttpTool, JobEventsTool, JobPromptTool, JobStatusTool,
+    JsonTool, ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool,
+    MemoryWriteTool, PlanUpdateTool, PromptQueue, ReadFileTool, ShellTool, SkillInstallTool,
+    SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool, ToolActivateTool, ToolAuthTool,
+    ToolInstallTool, ToolListTool, ToolPermissionSetTool, ToolRemoveTool, ToolSearchTool,
+    ToolUpgradeTool, WriteFileTool, shared_file_history, shared_read_file_state,
 };
 use crate::tools::rate_limiter::RateLimiter;
 use crate::tools::tool::{
@@ -107,6 +107,8 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "image_analyze",
     // Plan tools
     "plan_update",
+    // Job-only tools
+    "finish_job",
     // Permission tools
     "tool_permission_set",
     // Aliases (web_fetch is an alias for http in some contexts)
@@ -124,6 +126,8 @@ pub fn is_protected_tool_name(name: &str) -> bool {
 /// Registry of available tools.
 pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
+    /// Tools only visible when building tool definitions for job context.
+    job_only_tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
     /// Tracks which names were registered via the built-in startup path.
     builtin_names: RwLock<std::collections::HashSet<String>>,
     /// Shared credential registry populated by WASM tools, consumed by HTTP tool.
@@ -159,10 +163,15 @@ impl ToolRegistry {
         tool.engine_compatibility().is_visible_in(version)
     }
 
+    fn register_job_control_tools(&self) {
+        self.register_job_only_sync(Arc::new(FinishJobTool));
+    }
+
     /// Create a new empty registry. Defaults to engine V1.
     pub fn new() -> Self {
         Self {
             tools: RwLock::new(HashMap::new()),
+            job_only_tools: RwLock::new(HashMap::new()),
             builtin_names: RwLock::new(std::collections::HashSet::new()),
             credential_registry: None,
             secrets_store: None,
@@ -282,6 +291,30 @@ impl ToolRegistry {
         }
     }
 
+    /// Register a job-only tool (sync version for startup, marks as built-in).
+    ///
+    /// Job-only tools are invisible to `tool_definitions()` and `list()`;
+    /// they only appear via `tool_definitions_for_job()`. This prevents
+    /// interactive chat sessions from seeing tools that only make sense in
+    /// autonomous job/container contexts (e.g. `finish_job`).
+    pub fn register_job_only_sync(&self, tool: Arc<dyn Tool>) {
+        let name = tool.name().to_string();
+        if name.contains('.') {
+            tracing::warn!(
+                tool = %name,
+                "Rejecting job-only tool registration: name contains '.' which conflicts with settings path parsing"
+            );
+            return;
+        }
+        if let Ok(mut job_tools) = self.job_only_tools.try_write() {
+            job_tools.insert(name.clone(), tool);
+            if let Ok(mut builtins) = self.builtin_names.try_write() {
+                builtins.insert(name.clone());
+            }
+            tracing::debug!("Registered job-only tool: {}", name);
+        }
+    }
+
     /// Resolve a tool name to the key under which it is registered,
     /// trying the exact name first, then hyphen→underscore and
     /// underscore→hyphen aliases.
@@ -302,34 +335,68 @@ impl ToolRegistry {
         None
     }
 
-    /// Unregister a tool.  Uses the same alias resolution as `get()` so
-    /// callers that pass hyphenated names still find underscore-registered
-    /// tools.
+    /// Unregister a tool.
+    ///
+    /// Searches both regular and job-only maps so startup/teardown paths can
+    /// remove either kind of tool by name.
     pub async fn unregister(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        let mut tools = self.tools.write().await;
-        let key = Self::resolve_key(&tools, name)?;
-        tools.remove(&key)
+        {
+            let mut tools = self.tools.write().await;
+            if let Some(key) = Self::resolve_key(&tools, name) {
+                return tools.remove(&key);
+            }
+        }
+        let mut job_tools = self.job_only_tools.write().await;
+        let key = Self::resolve_key(&job_tools, name)?;
+        job_tools.remove(&key)
     }
 
-    /// Get a tool by name.
+    /// Get a non-job tool by name.
     ///
-    /// Falls back to a hyphen→underscore alias when the exact name is not
-    /// found, so that tool calls from LLM providers that normalise hyphens
-    /// (e.g. `notion_notion_search` vs the registered `notion_notion-search`)
-    /// still resolve correctly.
+    /// Job-only tools stay hidden from this API so interactive/chat flows
+    /// cannot resolve or execute them accidentally.
     pub async fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         let tools = self.tools.read().await;
         let key = Self::resolve_key(&tools, name)?;
         tools.get(&key).map(Arc::clone)
     }
 
+    /// Get a tool by name for autonomous job/container execution.
+    ///
+    /// Searches the regular tool map first, then falls back to job-only tools.
+    pub async fn get_for_job(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        {
+            let tools = self.tools.read().await;
+            if let Some(key) = Self::resolve_key(&tools, name) {
+                return tools.get(&key).map(Arc::clone);
+            }
+        }
+        let job_tools = self.job_only_tools.read().await;
+        let key = Self::resolve_key(&job_tools, name)?;
+        job_tools.get(&key).map(Arc::clone)
+    }
+
     /// Resolve a caller-provided action/tool name to the registered tool id.
     ///
     /// Tries exact match first, then hyphen→underscore (LLM normalization),
-    /// then underscore→hyphen (legacy WASM extensions).
+    /// then underscore→hyphen (legacy WASM extensions). Job-only tools stay
+    /// hidden from this API.
     pub async fn resolve_name(&self, name: &str) -> Option<String> {
         let tools = self.tools.read().await;
         Self::resolve_key(&tools, name)
+    }
+
+    /// Resolve a caller-provided action/tool name for autonomous job/container
+    /// execution, including job-only tools.
+    pub async fn resolve_name_for_job(&self, name: &str) -> Option<String> {
+        {
+            let tools = self.tools.read().await;
+            if let Some(key) = Self::resolve_key(&tools, name) {
+                return Some(key);
+            }
+        }
+        let job_tools = self.job_only_tools.read().await;
+        Self::resolve_key(&job_tools, name)
     }
 
     pub async fn get_resolved(&self, name: &str) -> Option<(String, Arc<dyn Tool>)> {
@@ -339,8 +406,22 @@ impl ToolRegistry {
         Some((key, tool))
     }
 
+    pub async fn get_resolved_for_job(&self, name: &str) -> Option<(String, Arc<dyn Tool>)> {
+        {
+            let tools = self.tools.read().await;
+            if let Some(key) = Self::resolve_key(&tools, name) {
+                let tool = tools.get(&key).map(Arc::clone)?;
+                return Some((key, tool));
+            }
+        }
+        let job_tools = self.job_only_tools.read().await;
+        let key = Self::resolve_key(&job_tools, name)?;
+        let tool = job_tools.get(&key).map(Arc::clone)?;
+        Some((key, tool))
+    }
+
     /// Resolve a tool/action name to its owning provider extension, when the
-    /// action is extension-backed.
+    /// action is extension-backed. Job-only tools stay hidden from this API.
     pub async fn provider_extension_for_tool(&self, name: &str) -> Option<String> {
         let tools = self.tools.read().await;
         let key = Self::resolve_key(&tools, name)?;
@@ -426,6 +507,33 @@ impl ToolRegistry {
         defs
     }
 
+    /// Get tool definitions for job contexts.
+    ///
+    /// Includes both regular tools and job-only tools (e.g. `finish_job`),
+    /// filtered by the registry's engine version. Use this when building the
+    /// tool list for autonomous job or container execution.
+    pub async fn tool_definitions_for_job(&self) -> Vec<ToolDefinition> {
+        let version = self.engine_version;
+        let mut defs: Vec<ToolDefinition> = self
+            .tools
+            .read()
+            .await
+            .values()
+            .filter(|tool| Self::is_engine_visible(tool.as_ref(), version))
+            .map(Self::tool_definition)
+            .chain(
+                self.job_only_tools
+                    .read()
+                    .await
+                    .values()
+                    .filter(|tool| Self::is_engine_visible(tool.as_ref(), version))
+                    .map(Self::tool_definition),
+            )
+            .collect();
+        defs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        defs
+    }
+
     /// Get tool definitions for specific tools.
     pub async fn tool_definitions_for(&self, names: &[&str]) -> Vec<ToolDefinition> {
         let tools = self.tools.read().await;
@@ -444,6 +552,7 @@ impl ToolRegistry {
         self.register_sync(Arc::new(TimeTool));
         self.register_sync(Arc::new(JsonTool));
         self.register_sync(Arc::new(PlanUpdateTool::new()));
+        self.register_job_control_tools();
 
         let mut http = HttpTool::new();
         if let (Some(cr), Some(ss)) = (&self.credential_registry, &self.secrets_store) {
@@ -494,6 +603,7 @@ impl ToolRegistry {
     /// These tools are intended to run inside sandboxed Docker containers.
     /// Call this in the worker process, not the orchestrator (unless `allow_local_tools = true`).
     pub fn register_container_tools(&self) {
+        self.register_job_control_tools();
         self.register_dev_tools();
     }
 
@@ -1596,6 +1706,100 @@ mod tests {
 
         assert!(names.contains(&"echo"));
         assert!(names.contains(&"v1_only_stub"));
+    }
+
+    // --- Job-only tool visibility -------------------------------------------
+
+    #[tokio::test]
+    async fn tool_definitions_for_job_includes_finish_job_in_v2() {
+        let registry = ToolRegistry::new().with_engine_version(EngineVersion::V2);
+        registry.register_builtin_tools();
+
+        let regular_defs = registry.tool_definitions().await;
+        let regular_names: Vec<&str> = regular_defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(
+            !regular_names.contains(&"finish_job"),
+            "job-only tools must stay hidden from non-job tool definitions"
+        );
+
+        let job_defs = registry.tool_definitions_for_job().await;
+        let job_names: Vec<&str> = job_defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(
+            job_names.contains(&"finish_job"),
+            "finish_job must be available in job contexts even when engine version is V2"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_only_tools_are_hidden_from_generic_lookup() {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+
+        assert!(
+            registry.get("finish_job").await.is_none(),
+            "job-only tools must stay hidden from generic lookup"
+        );
+        assert!(
+            registry.resolve_name("finish_job").await.is_none(),
+            "job-only tools must stay hidden from generic name resolution"
+        );
+        assert!(
+            registry.get_resolved("finish_job").await.is_none(),
+            "job-only tools must stay hidden from generic resolved lookup"
+        );
+
+        assert!(
+            registry.get_for_job("finish_job").await.is_some(),
+            "job lookup must resolve finish_job"
+        );
+        assert_eq!(
+            registry.resolve_name_for_job("finish_job").await.as_deref(),
+            Some("finish_job"),
+            "job lookup must resolve finish_job by name"
+        );
+        assert!(
+            registry.get_resolved_for_job("finish_job").await.is_some(),
+            "job lookup must resolve finish_job with canonical key"
+        );
+    }
+
+    // --- Container registration ---------------------------------------------
+
+    #[tokio::test]
+    async fn register_container_tools_includes_finish_job_for_job_contexts() {
+        let registry = ToolRegistry::new();
+        registry.register_container_tools();
+
+        let defs = registry.tool_definitions_for_job().await;
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(
+            names.contains(&"finish_job"),
+            "container tool registration must include finish_job for job execution"
+        );
+        assert!(
+            names.contains(&"shell"),
+            "container tool registration must include development tools"
+        );
+        assert!(
+            !names.contains(&"http"),
+            "container tool registration must not expose orchestrator-only HTTP access"
+        );
+        assert!(
+            !names.contains(&"echo"),
+            "container tool registration must stay scoped to dev tools plus finish_job"
+        );
+        assert!(
+            !names.contains(&"time"),
+            "container tool registration must stay scoped to dev tools plus finish_job"
+        );
+        assert!(
+            !names.contains(&"json"),
+            "container tool registration must stay scoped to dev tools plus finish_job"
+        );
+        assert!(
+            !names.contains(&"plan_update"),
+            "container tool registration must stay scoped to dev tools plus finish_job"
+        );
     }
 
     #[tokio::test]

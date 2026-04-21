@@ -27,12 +27,13 @@ use crate::llm::{
     ResponseMetadata, ToolCall, ToolSelection,
 };
 use crate::tenant::SystemScope;
+use crate::tools::builtin::{FinishJobStatus, parse_finish_job_signal};
 use crate::tools::execute::process_tool_result;
 use crate::tools::rate_limiter::RateLimitResult;
 use crate::tools::{ApprovalContext, ToolRegistry, prepare_tool_params, redact_params};
 use crate::worker::autonomous_recovery::{
     AutonomousRecoveryAction, AutonomousRecoveryState, EMPTY_TOOL_COMPLETION_FAILURE,
-    EMPTY_TOOL_COMPLETION_NUDGE, FORCE_TEXT_RECOVERY_PROMPT,
+    EMPTY_TOOL_COMPLETION_NUDGE, EMPTY_TOOL_COMPLETION_STRICT,
 };
 use ironclaw_common::{AppEvent, JobResultStatus};
 use ironclaw_safety::SafetyLayer;
@@ -75,6 +76,8 @@ struct ToolExecResult {
 }
 
 impl Worker {
+    const DEFAULT_COMPLETION_MESSAGE: &str = "Job completed successfully";
+
     /// Create a new worker for a specific job.
     pub fn new(job_id: Uuid, deps: WorkerDeps) -> Self {
         Self { job_id, deps }
@@ -271,7 +274,10 @@ Description: {}
 
 You have access to tools to complete this job. Plan your approach and execute tools as needed.
 You may request multiple tools at once if they can be executed in parallel.
-Report when the job is complete or if you encounter issues you cannot resolve."#,
+The only way to end this job is to call the `finish_job` tool.
+Call `finish_job` only after all other work is done.
+Use status \"completed\" when all required work is finished,
+or status \"failed\" when you hit an unresolvable blocker."#,
             job_ctx.title, job_ctx.description
         )));
 
@@ -301,7 +307,8 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                         );
                     }
                     Ok(_) => {
-                        self.mark_completed().await?;
+                        self.mark_completed(Self::DEFAULT_COMPLETION_MESSAGE)
+                            .await?;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -339,8 +346,15 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             .unwrap_or(50) as usize;
         let max_iterations = max_iterations.min(ironclaw_common::MAX_WORKER_ITERATIONS as usize);
 
-        // Initial tool definitions for planning (will be refreshed in loop)
-        reason_ctx.available_tools = self.tools().tool_definitions().await;
+        // Planning should only see work tools. Job-control tools like
+        // `finish_job` are reserved for the agentic loop / execution layer.
+        reason_ctx.available_tools = self
+            .tools()
+            .tool_definitions_for_job()
+            .await
+            .into_iter()
+            .filter(|def| def.name != "finish_job")
+            .collect();
 
         // Generate plan if planning is enabled
         let plan = if self.use_planning() {
@@ -390,7 +404,23 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
 
         // If we have a plan, execute it.
         if let Some(ref plan) = plan {
-            self.execute_plan(rx, reasoning, reason_ctx, plan).await?;
+            if let Some(outcome) = self.execute_plan(rx, reason_ctx, plan).await? {
+                match outcome {
+                    LoopOutcome::Response(_) => {
+                        // Completion was already handled by finish_job.
+                    }
+                    LoopOutcome::Failure(reason) => {
+                        self.mark_failed(&reason).await?;
+                    }
+                    LoopOutcome::Stopped => {
+                        // Stop signal handled — nothing more to do.
+                    }
+                    LoopOutcome::MaxIterations
+                    | LoopOutcome::NeedApproval(_)
+                    | LoopOutcome::AuthPending(_) => {}
+                }
+                return Ok(());
+            }
 
             if let Ok(ctx) = self.context_manager().get_context(self.job_id).await
                 && (ctx.state.is_terminal()
@@ -407,7 +437,6 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             rx: tokio::sync::Mutex::new(rx),
             consecutive_rate_limits: std::sync::atomic::AtomicUsize::new(0),
             recovery_state: tokio::sync::Mutex::new(AutonomousRecoveryState::default()),
-            has_text_response: std::sync::atomic::AtomicBool::new(false),
             cached_user_info: tokio::sync::OnceCell::new(),
             cached_admin_tool_policy: tokio::sync::OnceCell::new(),
         };
@@ -422,7 +451,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
 
         match outcome {
             LoopOutcome::Response(_) => {
-                // Completion was already handled in handle_text_response via mark_completed
+                // Completion was already handled by finish_job.
             }
             LoopOutcome::MaxIterations => {
                 self.mark_failed("Maximum iterations exceeded: job hit the iteration cap")
@@ -514,13 +543,11 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         tool_name: &str,
         params: &serde_json::Value,
     ) -> Result<String, Error> {
-        let tool =
-            deps.tools
-                .get(tool_name)
-                .await
-                .ok_or_else(|| crate::error::ToolError::NotFound {
-                    name: tool_name.to_string(),
-                })?;
+        let tool = deps.tools.get_for_job(tool_name).await.ok_or_else(|| {
+            crate::error::ToolError::NotFound {
+                name: tool_name.to_string(),
+            }
+        })?;
 
         let normalized_params = prepare_tool_params(tool.as_ref(), params);
 
@@ -894,10 +921,9 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
     async fn execute_plan(
         &self,
         rx: &mut mpsc::Receiver<WorkerMessage>,
-        reasoning: &Reasoning,
         reason_ctx: &mut ReasoningContext,
         plan: &ActionPlan,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<LoopOutcome>, Error> {
         for (i, action) in plan.actions.iter().enumerate() {
             // Check for stop signal and injected user messages
             while let Ok(msg) = rx.try_recv() {
@@ -907,7 +933,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                             "Worker for job {} received stop signal during plan execution",
                             self.job_id
                         );
-                        return Ok(());
+                        return Ok(Some(LoopOutcome::Stopped));
                     }
                     WorkerMessage::Ping => {
                         tracing::trace!("Worker for job {} received ping", self.job_id);
@@ -932,7 +958,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                                 "message": "Plan interrupted by user message, re-evaluating...",
                             }),
                         );
-                        return Ok(());
+                        return Ok(None);
                     }
                 }
             }
@@ -973,51 +999,69 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             let result = self
                 .execute_tool(&action.tool_name, &action.parameters)
                 .await;
+            let finish_signal = if selection.tool_name == "finish_job" {
+                match &result {
+                    Ok(_) => Some(parse_finish_job_signal(&selection.parameters).map_err(|e| {
+                        crate::error::Error::from(crate::error::ToolError::ExecutionFailed {
+                            name: "finish_job".to_string(),
+                            reason: format!(
+                                "finish_job executed but result could not be interpreted: {e}"
+                            ),
+                        })
+                    })?),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            let finish_outcome = finish_signal.clone().map(|signal| match signal.status {
+                FinishJobStatus::Completed => LoopOutcome::Response(signal.summary),
+                FinishJobStatus::Failed => LoopOutcome::Failure(signal.summary),
+            });
 
             self.process_tool_result_job(reason_ctx, &selection, result)
                 .await?;
 
+            if let Some(outcome) = finish_outcome {
+                if let Some(signal) = finish_signal.as_ref()
+                    && signal.status == FinishJobStatus::Completed
+                {
+                    self.mark_completed(&signal.summary).await.map_err(|e| {
+                        crate::error::Error::from(crate::error::JobError::ContextError {
+                            id: self.job_id,
+                            reason: e.to_string(),
+                        })
+                    })?;
+                }
+                return Ok(Some(outcome));
+            }
+
+            if selection.tool_name == "finish_job" {
+                return Ok(None);
+            }
+
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        // Plan completed — ask the LLM whether the job is done.
-        let msg_count_before = reason_ctx.messages.len();
+        // Plan completed — prompt the LLM to continue. The normal agentic loop
+        // will pick up after this method returns; the LLM can call finish_job
+        // when the job is actually done, or call more tools if work remains.
         reason_ctx.messages.push(ChatMessage::user(
-            "All planned actions have been executed. Assess the results: \
-             if the job is fully complete, state that the job is complete. \
-             Otherwise, briefly list what remains.",
+            "The planned actions have been executed. Continue working toward the goal. \
+             The only way to end the job is to call finish_job with valid arguments.",
         ));
+        tracing::info!(
+            "Job {} plan completed, continuing to agentic loop",
+            self.job_id
+        );
+        self.log_event(
+            "status",
+            serde_json::json!({
+                "message": "Plan completed, continuing execution...",
+            }),
+        );
 
-        let response = reasoning.respond(reason_ctx).await?;
-        let response = crate::agent::strip_suggestions(&response);
-
-        if crate::util::llm_signals_completion(&response) {
-            reason_ctx.messages.push(ChatMessage::assistant(&response));
-            self.mark_completed().await?;
-        } else {
-            // Replace the completion-check exchange with an action-oriented
-            // continuation prompt. Leaving the "Is the job complete?" / "No"
-            // dialogue in context causes the agentic loop to repeat the same
-            // analysis instead of calling tools (self-dialogue loop).
-            reason_ctx.messages.truncate(msg_count_before);
-            reason_ctx.messages.push(ChatMessage::user(format!(
-                "The planned actions are done but the job is not yet complete. \
-                 Remaining work:\n\n{response}\n\n\
-                 Continue executing now — use tools to finish the job."
-            )));
-            tracing::info!(
-                "Job {} plan completed but work remains, falling back to direct selection",
-                self.job_id
-            );
-            self.log_event(
-                "status",
-                serde_json::json!({
-                    "message": "Plan completed but job needs more work, continuing...",
-                }),
-            );
-        }
-
-        Ok(())
+        Ok(None)
     }
 
     async fn execute_tool(
@@ -1028,13 +1072,16 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         Self::execute_tool_inner(&self.deps, self.job_id, tool_name, params).await
     }
 
-    async fn mark_completed(&self) -> Result<(), Error> {
+    async fn mark_completed(&self, summary: &str) -> Result<(), Error> {
+        let message = if summary.trim().is_empty() {
+            Self::DEFAULT_COMPLETION_MESSAGE
+        } else {
+            summary
+        };
+
         self.context_manager()
             .update_context(self.job_id, |ctx| {
-                ctx.transition_to(
-                    JobState::Completed,
-                    Some("Job completed successfully".to_string()),
-                )
+                ctx.transition_to(JobState::Completed, Some(message.to_string()))
             })
             .await?
             .map_err(|s| crate::error::JobError::ContextError {
@@ -1047,13 +1094,10 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             serde_json::json!({
                 "status": "completed",
                 "success": true,
-                "message": "Job completed successfully",
+                "message": truncate_for_preview(message, 2000),
             }),
         );
-        self.persist_status(
-            JobState::Completed,
-            Some("Job completed successfully".to_string()),
-        );
+        self.persist_status(JobState::Completed, None);
         Ok(())
     }
 
@@ -1168,15 +1212,6 @@ fn store_fallback_in_metadata(
 }
 
 /// Job delegate: implements `LoopDelegate` for the background job context.
-/// Whether an LLM error represents a completion-eligible empty response.
-///
-/// Only `EmptyResponse` (provider returned no choices/content) qualifies.
-/// Infrastructure errors (`AuthFailed`, `Http`, `Io`, etc.) never qualify —
-/// they must propagate even if prior text output was produced.
-fn is_completion_eligible_error(error: &crate::error::LlmError) -> bool {
-    matches!(error, crate::error::LlmError::EmptyResponse { .. })
-}
-
 ///
 /// Handles: signal channel (stop/ping/user messages), cancellation checks,
 /// rate-limit retry, parallel tool execution, DB persistence, SSE broadcasting.
@@ -1186,10 +1221,6 @@ struct JobDelegate<'a> {
     /// Tracks consecutive rate-limit errors to fail fast instead of burning iterations.
     consecutive_rate_limits: std::sync::atomic::AtomicUsize,
     recovery_state: tokio::sync::Mutex<AutonomousRecoveryState>,
-    /// Whether a substantive (non-empty) text response has been produced.
-    /// When true, an empty follow-up response is treated as job completion
-    /// rather than a retry signal (prevents spurious failures in routines).
-    has_text_response: std::sync::atomic::AtomicBool,
     /// Cached (user_id, is_admin) for admin tool policy filtering. Populated once
     /// on first access to avoid repeated DB lookups.
     cached_user_info: tokio::sync::OnceCell<(String, bool)>,
@@ -1286,54 +1317,6 @@ impl<'a> JobDelegate<'a> {
             metadata: ResponseMetadata::default(),
         })
     }
-
-    /// Mark the job as completed, logging a warning on failure.
-    async fn mark_completed_or_warn(&self, context: &str) {
-        if let Err(e) = self.worker.mark_completed().await {
-            tracing::warn!(
-                job_id = %self.worker.job_id,
-                error = %e,
-                "Failed to mark job completed ({context})"
-            );
-        }
-    }
-
-    /// If a substantive text response was already produced and the error
-    /// indicates the LLM simply returned nothing, treat it as successful
-    /// completion rather than a fatal failure.
-    ///
-    /// Only swallows `EmptyResponse` — infrastructure errors (`AuthFailed`,
-    /// `ContextLengthExceeded`, `Http`, `Io`, etc.) always propagate.
-    ///
-    /// Returns `Some(empty RespondOutput)` when the error should be swallowed,
-    /// `None` when it should propagate normally.
-    async fn try_complete_on_error(
-        &self,
-        context: &str,
-        error: &crate::error::LlmError,
-    ) -> Option<crate::llm::RespondOutput> {
-        if !is_completion_eligible_error(error) {
-            return None;
-        }
-        if !self
-            .has_text_response
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return None;
-        }
-        tracing::info!(
-            job_id = %self.worker.job_id,
-            error = %error,
-            "{context} empty response after text output — treating as completion"
-        );
-        self.mark_completed_or_warn(context).await;
-        Some(crate::llm::RespondOutput {
-            result: RespondResult::Text(String::new()),
-            usage: crate::llm::TokenUsage::default(),
-            finish_reason: crate::llm::FinishReason::Stop,
-            metadata: ResponseMetadata::default(),
-        })
-    }
 }
 
 #[async_trait]
@@ -1423,56 +1406,55 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
         reason_ctx: &mut ReasoningContext,
         _iteration: usize,
     ) -> Option<LoopOutcome> {
-        let force_text_recovery = {
+        let recovery_mode_active = {
             let mut recovery = self.recovery_state.lock().await;
             recovery.begin_iteration()
         };
 
-        if force_text_recovery {
+        if recovery_mode_active {
             tracing::warn!(
                 job_id = %self.worker.job_id,
-                "Switching to text-only recovery after malformed tool completions"
+                "Retrying after malformed tool completions with tools still enabled"
             );
-            reason_ctx.available_tools.clear();
-        } else {
-            // Refresh tool definitions so newly built tools become visible
-            let tool_defs = self.worker.tools().tool_definitions().await;
-
-            // Apply admin tool policy filtering (multi-tenant only).
-            let (user_id, is_admin) = self.resolve_user_info().await;
-            let admin_policy = self
-                .cached_admin_tool_policy
-                .get_or_init(|| async {
-                    let Some(store) = self.worker.store() else {
-                        return crate::tools::permissions::AdminToolPolicyState::Missing;
-                    };
-
-                    match store.get_admin_tool_policy().await {
-                        Ok(Some(policy)) => {
-                            crate::tools::permissions::AdminToolPolicyState::Loaded(policy)
-                        }
-                        Ok(None) => crate::tools::permissions::AdminToolPolicyState::Missing,
-                        Err(error) => {
-                            tracing::warn!(
-                                job_id = %self.worker.job_id,
-                                %error,
-                                "Failed to load admin tool policy for worker, failing closed"
-                            );
-                            crate::tools::permissions::AdminToolPolicyState::FailClosed
-                        }
-                    }
-                })
-                .await;
-            let tool_defs = crate::tools::permissions::filter_admin_disabled_tools(
-                tool_defs,
-                self.worker.deps.multi_tenant,
-                *is_admin,
-                user_id,
-                admin_policy,
-            );
-
-            reason_ctx.available_tools = tool_defs;
         }
+
+        // Refresh tool definitions so newly built tools become visible.
+        let tool_defs = self.worker.tools().tool_definitions_for_job().await;
+
+        // Apply admin tool policy filtering (multi-tenant only).
+        let (user_id, is_admin) = self.resolve_user_info().await;
+        let admin_policy = self
+            .cached_admin_tool_policy
+            .get_or_init(|| async {
+                let Some(store) = self.worker.store() else {
+                    return crate::tools::permissions::AdminToolPolicyState::Missing;
+                };
+
+                match store.get_admin_tool_policy().await {
+                    Ok(Some(policy)) => {
+                        crate::tools::permissions::AdminToolPolicyState::Loaded(policy)
+                    }
+                    Ok(None) => crate::tools::permissions::AdminToolPolicyState::Missing,
+                    Err(error) => {
+                        tracing::warn!(
+                            job_id = %self.worker.job_id,
+                            %error,
+                            "Failed to load admin tool policy for worker, failing closed"
+                        );
+                        crate::tools::permissions::AdminToolPolicyState::FailClosed
+                    }
+                }
+            })
+            .await;
+        let tool_defs = crate::tools::permissions::filter_admin_disabled_tools(
+            tool_defs,
+            self.worker.deps.multi_tenant,
+            *is_admin,
+            user_id,
+            admin_policy,
+        );
+
+        reason_ctx.available_tools = tool_defs;
 
         // Claude 4.6 rejects assistant prefill; NEAR AI rejects any non-user-ending
         // conversation. Ensure the last message is user-role before calling the LLM.
@@ -1513,12 +1495,7 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
             Err(crate::error::LlmError::RateLimited { retry_after, .. }) => {
                 return self.handle_rate_limit(retry_after, "tool selection").await;
             }
-            Err(e) => {
-                if let Some(output) = self.try_complete_on_error("select_tools", &e).await {
-                    return Ok(output);
-                }
-                return Err(e.into());
-            }
+            Err(e) => return Err(e.into()),
         };
 
         // Fall back to respond_with_tools
@@ -1548,12 +1525,7 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
                 self.handle_rate_limit(retry_after, "respond_with_tools")
                     .await
             }
-            Err(e) => {
-                if let Some(output) = self.try_complete_on_error("respond_with_tools", &e).await {
-                    return Ok(output);
-                }
-                Err(e.into())
-            }
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -1585,20 +1557,20 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
                     .push(ChatMessage::user(EMPTY_TOOL_COMPLETION_NUDGE));
                 return TextAction::Continue;
             }
-            AutonomousRecoveryAction::ForceTextRecovery => {
+            AutonomousRecoveryAction::StrictToolRecovery => {
                 tracing::warn!(
                     job_id = %self.worker.job_id,
-                    "Repeated malformed tool completions detected; switching to text-only recovery"
+                    "Autonomous recovery escalated; requiring a valid tool call on the next reply"
                 );
                 self.worker.log_event(
                     "status",
                     serde_json::json!({
-                        "message": "Model returned repeated empty tool-completion responses; requesting a final status update without tools.",
+                        "message": "Model failed to recover after a tool-use nudge; requiring a valid tool call or finish_job next.",
                     }),
                 );
                 reason_ctx
                     .messages
-                    .push(ChatMessage::user(FORCE_TEXT_RECOVERY_PROMPT));
+                    .push(ChatMessage::user(EMPTY_TOOL_COMPLETION_STRICT));
                 return TextAction::Continue;
             }
             AutonomousRecoveryAction::Fail => {
@@ -1613,44 +1585,17 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
             AutonomousRecoveryAction::Continue => {}
         }
 
-        // Empty text after a substantive response means the LLM has finished.
-        // Treat as successful completion rather than continuing the loop (which
-        // would produce "Response contained no message or tool call (empty)").
+        // Empty text: do not auto-complete. Completion is only via finish_job.
+        // Rate-limit backoff frames (no prior output) and genuine empties are both
+        // handled by returning Continue; the loop's max_iterations cap and nudge
+        // mechanism prevent infinite spinning.
         if text.is_empty() {
-            if self
-                .has_text_response
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                tracing::debug!(
-                    job_id = %self.worker.job_id,
-                    "Empty response after text output — treating as completion"
-                );
-                self.mark_completed_or_warn("empty text response").await;
-                return TextAction::Return(LoopOutcome::Response(String::new()));
-            }
-            // No prior text response — this is likely a rate-limit backoff retry.
             return TextAction::Continue;
         }
 
         // Jobs run autonomously — strip <suggestions> tags that are only
         // meaningful for interactive chat sessions.
         let text = crate::agent::strip_suggestions(text);
-
-        // A non-empty text response with no tool intent (already filtered
-        // by the agentic loop's nudge mechanism) is the LLM's final answer.
-        // Mark the job complete and stop the loop. Without this, the LLM
-        // restates its summary every iteration until the cap is hit.
-        if let Err(e) = self.worker.mark_completed().await {
-            tracing::warn!(
-                "Failed to mark job {} as completed: {}",
-                self.worker.job_id,
-                e
-            );
-        }
-
-        // Track that a substantive response has been produced.
-        self.has_text_response
-            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Add assistant response to context
         reason_ctx.messages.push(ChatMessage::assistant(&text));
@@ -1663,7 +1608,7 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
             }),
         );
 
-        TextAction::Return(LoopOutcome::Response(text))
+        TextAction::Continue
     }
 
     async fn execute_tool_calls(
@@ -1740,8 +1685,21 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
                 tool_calls.clone(),
             ));
 
-        // Convert to ToolSelections
-        let selections: Vec<ToolSelection> = tool_calls
+        // Partition: keep all non-finish_job calls first, then handle every
+        // finish_job call at the end. If the model emits multiple finish_job
+        // calls, only the last one decides the final status/summary.
+        let mut finish_job_calls: Vec<crate::llm::ToolCall> = Vec::new();
+        let mut other_calls: Vec<crate::llm::ToolCall> = Vec::with_capacity(tool_calls.len());
+        for tc in tool_calls {
+            if tc.name == "finish_job" {
+                finish_job_calls.push(tc);
+            } else {
+                other_calls.push(tc);
+            }
+        }
+
+        // Convert non-finish_job calls to ToolSelections and execute.
+        let selections: Vec<ToolSelection> = other_calls
             .iter()
             .map(|tc| ToolSelection {
                 tool_name: tc.name.clone(),
@@ -1754,7 +1712,7 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
 
         // Execute tools (parallel for multiple, direct for single)
         let mut tool_failure_count: usize = 0;
-        let total_tools = selections.len();
+        let total_tools = selections.len() + finish_job_calls.len();
 
         if selections.len() == 1 {
             let selection = &selections[0];
@@ -1768,7 +1726,7 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
             self.worker
                 .process_tool_result_job(reason_ctx, selection, result)
                 .await?;
-        } else {
+        } else if !selections.is_empty() {
             let results = self.worker.execute_tools_parallel(&selections).await;
             for (selection, result) in selections.iter().zip(results) {
                 if result.result.is_err() {
@@ -1782,6 +1740,62 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
 
         reason_ctx.last_tool_batch_all_failed =
             total_tools > 0 && tool_failure_count == total_tools;
+
+        // Now handle finish_job — always runs last so other tools complete first.
+        for (idx, tc) in finish_job_calls.iter().enumerate() {
+            let is_last_finish_job = idx + 1 == finish_job_calls.len();
+            let selection = ToolSelection {
+                tool_name: tc.name.clone(),
+                parameters: tc.arguments.clone(),
+                reasoning: tc.reasoning.clone().unwrap_or_default(),
+                alternatives: vec![],
+                tool_call_id: tc.id.clone(),
+            };
+            let result = self
+                .worker
+                .execute_tool(&selection.tool_name, &selection.parameters)
+                .await;
+            if result.is_err() {
+                tool_failure_count += 1;
+                self.worker
+                    .process_tool_result_job(reason_ctx, &selection, result)
+                    .await?;
+                reason_ctx.last_tool_batch_all_failed =
+                    total_tools > 0 && tool_failure_count == total_tools;
+                if is_last_finish_job {
+                    return Ok(None);
+                }
+                continue;
+            }
+            self.worker
+                .process_tool_result_job(reason_ctx, &selection, result)
+                .await?;
+
+            if is_last_finish_job {
+                let signal = parse_finish_job_signal(&selection.parameters).map_err(|e| {
+                    crate::error::Error::from(crate::error::ToolError::ExecutionFailed {
+                        name: "finish_job".to_string(),
+                        reason: format!(
+                            "finish_job executed but result could not be interpreted: {e}"
+                        ),
+                    })
+                })?;
+
+                if signal.status == FinishJobStatus::Completed {
+                    self.worker
+                        .mark_completed(&signal.summary)
+                        .await
+                        .map_err(|e| {
+                            crate::error::Error::from(crate::error::JobError::ContextError {
+                                id: self.worker.job_id,
+                                reason: e.to_string(),
+                            })
+                        })?;
+                    return Ok(Some(LoopOutcome::Response(signal.summary)));
+                }
+                return Ok(Some(LoopOutcome::Failure(signal.summary)));
+            }
+        }
 
         Ok(None)
     }
@@ -1835,16 +1849,18 @@ impl From<TaskOutput> for Result<String, Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
 
     use crate::channels::ChannelManager;
+    #[cfg(feature = "libsql")]
+    use crate::db::Database;
     use crate::llm::ToolSelection;
 
     use super::*;
     use crate::config::SafetyConfig;
     use crate::context::JobContext;
     use crate::llm::{
-        CompletionRequest, CompletionResponse, LlmProvider, ToolCompletionRequest,
+        CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ToolCompletionRequest,
         ToolCompletionResponse,
     };
     use crate::testing::{BroadcastCapture, RecordingBroadcastChannel};
@@ -1911,9 +1927,91 @@ mod tests {
         }
     }
 
+    struct PlanningFinishJobLlm {
+        planning_prompt: StdMutex<Option<String>>,
+    }
+
+    impl PlanningFinishJobLlm {
+        fn new() -> Self {
+            Self {
+                planning_prompt: StdMutex::new(None),
+            }
+        }
+
+        fn planning_prompt(&self) -> Option<String> {
+            self.planning_prompt.lock().unwrap().clone() // safety: test-only mutex access
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for PlanningFinishJobLlm {
+        fn model_name(&self) -> &str {
+            "planning-finish-job"
+        }
+
+        fn cost_per_token(&self) -> (rust_decimal::Decimal, rust_decimal::Decimal) {
+            (rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            req: CompletionRequest,
+        ) -> Result<CompletionResponse, crate::error::LlmError> {
+            let system_prompt = req
+                .messages
+                .iter()
+                .find(|message| message.role == crate::llm::Role::System)
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            *self.planning_prompt.lock().unwrap() = Some(system_prompt); // safety: test-only mutex access
+
+            Ok(CompletionResponse {
+                content: serde_json::json!({
+                    "goal": "Finish the job cleanly",
+                    "actions": [
+                        {
+                            "tool_name": "finish_job",
+                            "parameters": {
+                                "status": "completed",
+                                "summary": "Planned completion"
+                            },
+                            "reasoning": "The job is already done",
+                            "expected_outcome": "The worker terminates"
+                        }
+                    ],
+                    "estimated_cost": 0.0,
+                    "estimated_time_secs": 0,
+                    "confidence": 1.0
+                })
+                .to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
+                finish_reason: FinishReason::Stop,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _req: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, crate::error::LlmError> {
+            panic!("agentic loop should not continue after planned finish_job");
+        }
+    }
+
     /// Build a Worker wired to a ToolRegistry containing the given tools.
     async fn make_worker(tools: Vec<Arc<dyn Tool>>) -> Worker {
+        make_worker_with_llm(tools, Arc::new(StubLlm), false).await
+    }
+
+    async fn make_worker_with_llm(
+        tools: Vec<Arc<dyn Tool>>,
+        llm: Arc<dyn LlmProvider>,
+        use_planning: bool,
+    ) -> Worker {
         let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
         for t in tools {
             registry.register(t).await;
         }
@@ -1923,13 +2021,52 @@ mod tests {
 
         let deps = WorkerDeps {
             context_manager: cm,
-            llm: Arc::new(StubLlm),
+            llm,
             safety: Arc::new(SafetyLayer::new(&SafetyConfig {
                 max_output_length: 100_000,
                 injection_check_enabled: false,
             })),
             tools: Arc::new(registry),
             store: None,
+            hooks: Arc::new(crate::hooks::HookRegistry::new()),
+            timeout: Duration::from_secs(30),
+            use_planning,
+            sse_tx: None,
+            approval_context: None,
+            http_interceptor: None,
+            multi_tenant: false,
+        };
+
+        Worker::new(job_id, deps)
+    }
+
+    #[cfg(feature = "libsql")]
+    async fn make_worker_with_store(tools: Vec<Arc<dyn Tool>>, store: Arc<dyn Database>) -> Worker {
+        let registry = ToolRegistry::new();
+        registry.register_builtin_tools();
+        for t in tools {
+            registry.register(t).await;
+        }
+
+        let cm = Arc::new(crate::context::ContextManager::new(5));
+        let job_id = cm
+            .create_job_for_user("worker-test-user", "test", "test job")
+            .await
+            .unwrap(); // safety: test
+        let ctx = cm.get_context(job_id).await.unwrap(); // safety: test
+
+        let system_store = SystemScope::new(store);
+        system_store.save_job(&ctx).await.unwrap(); // safety: test
+
+        let deps = WorkerDeps {
+            context_manager: cm,
+            llm: Arc::new(StubLlm),
+            safety: Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 100_000,
+                injection_check_enabled: false,
+            })),
+            tools: Arc::new(registry),
+            store: Some(system_store),
             hooks: Arc::new(crate::hooks::HookRegistry::new()),
             timeout: Duration::from_secs(30),
             use_planning: false,
@@ -1940,6 +2077,77 @@ mod tests {
         };
 
         Worker::new(job_id, deps)
+    }
+
+    async fn transition_worker_to_in_progress(worker: &Worker) {
+        worker
+            .context_manager()
+            .update_context(worker.job_id, |ctx| {
+                ctx.transition_to(JobState::InProgress, None)
+            })
+            .await
+            .unwrap() // safety: test
+            .unwrap(); // safety: test
+    }
+
+    fn make_job_delegate<'a>(
+        worker: &'a Worker,
+        rx: &'a mut tokio::sync::mpsc::Receiver<WorkerMessage>,
+    ) -> JobDelegate<'a> {
+        JobDelegate {
+            worker,
+            rx: tokio::sync::Mutex::new(rx),
+            consecutive_rate_limits: std::sync::atomic::AtomicUsize::new(0),
+            recovery_state: tokio::sync::Mutex::new(AutonomousRecoveryState::default()),
+            cached_user_info: tokio::sync::OnceCell::new(),
+            cached_admin_tool_policy: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    fn finish_job_call(id: &str, status: &str, summary: Option<&str>) -> crate::llm::ToolCall {
+        let arguments = match summary {
+            Some(summary) => serde_json::json!({
+                "status": status,
+                "summary": summary,
+            }),
+            None => serde_json::json!({
+                "status": status,
+            }),
+        };
+
+        crate::llm::ToolCall {
+            id: id.to_string(),
+            name: "finish_job".to_string(),
+            arguments,
+            reasoning: None,
+        }
+    }
+
+    async fn execute_tool_batch(
+        worker: &Worker,
+        tool_calls: Vec<crate::llm::ToolCall>,
+    ) -> Result<(Option<LoopOutcome>, ReasoningContext), crate::error::Error> {
+        let (_, mut rx) = tokio::sync::mpsc::channel(1);
+        let delegate = make_job_delegate(worker, &mut rx);
+        let mut reason_ctx = ReasoningContext::new();
+        let outcome = delegate
+            .execute_tool_calls(tool_calls, None, &mut reason_ctx)
+            .await?;
+        Ok((outcome, reason_ctx))
+    }
+
+    fn assert_response_outcome(outcome: Option<LoopOutcome>, expected: &str) {
+        assert!(
+            matches!(outcome, Some(LoopOutcome::Response(ref s)) if s == expected),
+            "expected Response({expected:?})"
+        ); // safety: test
+    }
+
+    fn assert_failure_outcome(outcome: Option<LoopOutcome>, expected: &str) {
+        assert!(
+            matches!(outcome, Some(LoopOutcome::Failure(ref s)) if s == expected),
+            "expected Failure({expected:?})"
+        ); // safety: test
     }
 
     async fn make_worker_with_message_tool()
@@ -2091,16 +2299,12 @@ mod tests {
     async fn test_mark_completed_twice_is_idempotent() {
         let worker = make_worker(vec![]).await;
 
-        worker
-            .context_manager()
-            .update_context(worker.job_id, |ctx| {
-                ctx.transition_to(JobState::InProgress, None)
-            })
-            .await
-            .unwrap() // safety: test
-            .unwrap(); // safety: test
+        transition_worker_to_in_progress(&worker).await;
 
-        worker.mark_completed().await.unwrap(); // safety: test
+        worker
+            .mark_completed("Completed in first pass")
+            .await
+            .unwrap(); // safety: test
 
         let ctx = worker
             .context_manager()
@@ -2112,7 +2316,7 @@ mod tests {
         // Second mark_completed should succeed (idempotent) rather than
         // erroring, matching the fix for the execution_loop / worker wrapper
         // race condition.
-        let result = worker.mark_completed().await;
+        let result = worker.mark_completed("Completed in first pass").await;
         assert!(
             /* safety: test */
             result.is_ok(),
@@ -2126,6 +2330,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ctx.state, JobState::Completed);
+    }
+
+    // --- Completion persistence ---------------------------------------------
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_finish_job_persists_completion_summary_as_result_event() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let worker = make_worker_with_store(vec![], Arc::clone(&db)).await;
+        transition_worker_to_in_progress(&worker).await;
+
+        let summary = "Indexed the repo and wrote the final report";
+        let outcome = execute_tool_batch(
+            &worker,
+            vec![finish_job_call("call_finish", "completed", Some(summary))],
+        )
+        .await
+        .map(|(outcome, _)| outcome)
+        .unwrap();
+
+        assert_response_outcome(outcome, summary);
+
+        let system_store = SystemScope::new(db);
+        let persisted_message = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(message) = system_store
+                    .get_agent_job_result_message(worker.job_id)
+                    .await
+                    .unwrap()
+                {
+                    break message;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("result event should be persisted"); // safety: test
+
+        assert_eq!(persisted_message, summary); // safety: test
+        assert!(
+            system_store
+                .get_agent_job_failure_reason(worker.job_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "successful jobs must not populate failure_reason"
+        );
     }
 
     /// Build a Worker with the given approval context.
@@ -2415,15 +2666,7 @@ mod tests {
     async fn test_token_budget_exceeded_fails_job() {
         let worker = make_worker(vec![]).await;
 
-        // Transition to InProgress (required for mark_failed)
-        worker
-            .context_manager()
-            .update_context(worker.job_id, |ctx| {
-                ctx.transition_to(JobState::InProgress, None)
-            })
-            .await
-            .unwrap() // safety: test
-            .unwrap(); // safety: test
+        transition_worker_to_in_progress(&worker).await;
 
         // Set a token budget
         worker
@@ -2464,15 +2707,7 @@ mod tests {
     async fn test_iteration_cap_marks_failed_not_stuck() {
         let worker = make_worker(vec![]).await;
 
-        // Transition to InProgress (required for mark_failed)
-        worker
-            .context_manager()
-            .update_context(worker.job_id, |ctx| {
-                ctx.transition_to(JobState::InProgress, None)
-            })
-            .await
-            .unwrap() // safety: test
-            .unwrap(); // safety: test
+        transition_worker_to_in_progress(&worker).await;
 
         // Simulate what the execution loop does when max_iterations is exceeded
         worker
@@ -2493,36 +2728,18 @@ mod tests {
         );
     }
 
-    /// Regression: a text response without rigid completion phrases (e.g.
-    /// "Weekly review completed and saved to Notion") must still terminate the
-    /// agentic loop and mark the job complete, rather than continuing until
-    /// max_iterations.
+    // --- Completion contract -------------------------------------------------
+
+    /// Text responses no longer auto-complete the job. Only finish_job terminates.
     #[tokio::test]
-    async fn test_text_response_terminates_loop_without_explicit_completion_phrase() {
+    async fn test_text_response_does_not_terminate_loop() {
         let worker = make_worker(vec![]).await;
-        worker
-            .context_manager()
-            .update_context(worker.job_id, |ctx| {
-                ctx.transition_to(JobState::InProgress, None)
-            })
-            .await
-            .unwrap() // safety: test
-            .unwrap(); // safety: test
+        transition_worker_to_in_progress(&worker).await;
 
         let (_, mut rx) = tokio::sync::mpsc::channel(1);
-        let delegate = JobDelegate {
-            worker: &worker,
-            rx: tokio::sync::Mutex::new(&mut rx),
-            consecutive_rate_limits: std::sync::atomic::AtomicUsize::new(0),
-            recovery_state: tokio::sync::Mutex::new(AutonomousRecoveryState::default()),
-            has_text_response: std::sync::atomic::AtomicBool::new(false),
-            cached_user_info: tokio::sync::OnceCell::new(),
-            cached_admin_tool_policy: tokio::sync::OnceCell::new(),
-        };
-
+        let delegate = make_job_delegate(&worker, &mut rx);
         let mut reason_ctx = ReasoningContext::new();
 
-        // Text that a real LLM would produce but doesn't match llm_signals_completion
         let action = delegate
             .handle_text_response(
                 "Weekly review created in Notion and notification sent.",
@@ -2532,8 +2749,133 @@ mod tests {
             .await;
 
         assert!(
-            matches!(action, TextAction::Return(_)),
-            "Text response should terminate the loop, got Continue"
+            matches!(action, TextAction::Continue),
+            "Text response should NOT terminate the loop, got Return"
+        ); // safety: test
+
+        let ctx = worker
+            .context_manager()
+            .get_context(worker.job_id)
+            .await
+            .unwrap(); // safety: test
+        assert_eq!(ctx.state, JobState::InProgress); // safety: test
+    }
+
+    /// finish_job tool call terminates the loop and marks the job complete.
+    #[tokio::test]
+    async fn test_finish_job_terminates_loop() {
+        let worker = make_worker(vec![]).await;
+        transition_worker_to_in_progress(&worker).await;
+
+        let outcome = execute_tool_batch(
+            &worker,
+            vec![finish_job_call(
+                "call_1",
+                "completed",
+                Some("All tasks done"),
+            )],
+        )
+        .await
+        .map(|(outcome, _)| outcome)
+        .unwrap();
+
+        assert_response_outcome(outcome, "All tasks done");
+
+        let ctx = worker
+            .context_manager()
+            .get_context(worker.job_id)
+            .await
+            .unwrap(); // safety: test
+        assert_eq!(ctx.state, JobState::Completed); // safety: test
+        assert_eq!(
+            ctx.transitions
+                .last()
+                .and_then(|transition| transition.reason.as_deref()),
+            Some("All tasks done")
+        ); // safety: test
+    }
+
+    /// Blank completion summaries are normalized to a stable default message.
+    #[tokio::test]
+    async fn test_finish_job_blank_completed_summary_uses_default_message() {
+        let worker = make_worker(vec![]).await;
+        transition_worker_to_in_progress(&worker).await;
+
+        let outcome = execute_tool_batch(
+            &worker,
+            vec![finish_job_call(
+                "call_blank_complete",
+                "completed",
+                Some(" \n\t "),
+            )],
+        )
+        .await
+        .map(|(outcome, _)| outcome)
+        .unwrap();
+
+        assert_response_outcome(outcome, "Job completed successfully with no summary.");
+
+        let ctx = worker
+            .context_manager()
+            .get_context(worker.job_id)
+            .await
+            .unwrap(); // safety: test
+        assert_eq!(ctx.state, JobState::Completed); // safety: test
+        assert_eq!(
+            ctx.transitions
+                .last()
+                .and_then(|transition| transition.reason.as_deref()),
+            Some("Job completed successfully with no summary.")
+        ); // safety: test
+    }
+
+    /// Empty text responses no longer auto-complete the job; they return Continue.
+    #[tokio::test]
+    async fn test_empty_text_continues_not_terminates() {
+        let worker = make_worker(vec![]).await;
+        transition_worker_to_in_progress(&worker).await;
+
+        let (_, mut rx) = tokio::sync::mpsc::channel(1);
+        let delegate = make_job_delegate(&worker, &mut rx);
+        let mut reason_ctx = ReasoningContext::new();
+
+        let action = delegate
+            .handle_text_response("", ResponseMetadata::default(), &mut reason_ctx)
+            .await;
+
+        assert!(
+            matches!(action, TextAction::Continue),
+            "Empty text must return Continue, not terminate the loop"
+        ); // safety: test
+
+        let ctx = worker
+            .context_manager()
+            .get_context(worker.job_id)
+            .await
+            .unwrap(); // safety: test
+        assert_eq!(ctx.state, JobState::InProgress); // safety: test
+    }
+
+    #[tokio::test]
+    async fn test_planning_excludes_finish_job_but_executes_it_if_returned_anyway() {
+        let llm = Arc::new(PlanningFinishJobLlm::new());
+        let worker = make_worker_with_llm(vec![], llm.clone(), true).await;
+        transition_worker_to_in_progress(&worker).await;
+
+        let reasoning =
+            Reasoning::new(worker.llm().clone()).with_model_name(worker.llm().active_model_name());
+        let mut reason_ctx = ReasoningContext::new().with_job("test job");
+        let (_, mut rx) = tokio::sync::mpsc::channel(1);
+
+        worker
+            .execution_loop(&mut rx, &reasoning, &mut reason_ctx)
+            .await
+            .unwrap(); // safety: test
+
+        let planning_prompt = llm.planning_prompt().unwrap_or_default();
+        assert!(
+            !planning_prompt.contains("finish_job"),
+            "planning prompt must not advertise finish_job: {planning_prompt}"
         ); // safety: test
 
         let ctx = worker
@@ -2543,6 +2885,10 @@ mod tests {
             .unwrap(); // safety: test
         assert_eq!(ctx.state, JobState::Completed); // safety: test
     }
+
+    // --- LLM bookkeeping regressions ----------------------------------------
+
+    // --- finish_job batch semantics -----------------------------------------
 
     /// Regression test: selections_to_tool_calls must preserve tool_call_id
     /// so that tool_result messages match the assistant_with_tool_calls message
@@ -2762,62 +3108,6 @@ mod tests {
         assert_eq!(telegram[0].1.content, "hello from routine");
     }
 
-    /// Regression test: only `EmptyResponse` errors are eligible for
-    /// completion-swallowing. Infrastructure errors must always propagate.
-    #[test]
-    fn is_completion_eligible_only_matches_empty_response() {
-        use crate::error::LlmError;
-
-        // EmptyResponse is eligible
-        assert!(super::is_completion_eligible_error(
-            &LlmError::EmptyResponse {
-                provider: "test".to_string(),
-            }
-        ));
-
-        // All other variants are NOT eligible
-        assert!(!super::is_completion_eligible_error(
-            &LlmError::InvalidResponse {
-                provider: "test".to_string(),
-                reason: "parse error".to_string(),
-            }
-        ));
-        assert!(!super::is_completion_eligible_error(
-            &LlmError::AuthFailed {
-                provider: "test".to_string(),
-            }
-        ));
-        assert!(!super::is_completion_eligible_error(
-            &LlmError::ContextLengthExceeded {
-                used: 100_000,
-                limit: 50_000,
-            }
-        ));
-        assert!(!super::is_completion_eligible_error(
-            &LlmError::ModelNotAvailable {
-                provider: "test".to_string(),
-                model: "gpt-4".to_string(),
-            }
-        ));
-        assert!(!super::is_completion_eligible_error(
-            &LlmError::RequestFailed {
-                provider: "test".to_string(),
-                reason: "timeout".to_string(),
-            }
-        ));
-        assert!(!super::is_completion_eligible_error(
-            &LlmError::SessionExpired {
-                provider: "test".to_string(),
-            }
-        ));
-        assert!(!super::is_completion_eligible_error(
-            &LlmError::SessionRenewalFailed {
-                provider: "test".to_string(),
-                reason: "timeout".to_string(),
-            }
-        ));
-    }
-
     /// Regression test: AutonomousUnavailable errors must be recoverable.
     /// Previously the job worker treated them as fatal, killing the entire
     /// job instead of feeding the error back to the LLM.
@@ -2851,5 +3141,198 @@ mod tests {
             !reason_ctx.messages.is_empty(),
             "Error message should be added to reason_ctx for the LLM"
         );
+    }
+
+    /// finish_job in a mixed batch executes other tools first, then terminates the loop.
+    #[tokio::test]
+    async fn test_finish_job_in_mixed_batch_executes_others_first() {
+        use crate::tools::{Tool, ToolError as ToolExecError, ToolOutput};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// A tool that records whether it was called.
+        struct RecordTool {
+            called: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl Tool for RecordTool {
+            fn name(&self) -> &str {
+                "record_tool"
+            }
+            fn description(&self) -> &str {
+                "Records execution"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object", "properties": {}})
+            }
+            async fn execute(
+                &self,
+                _params: serde_json::Value,
+                _ctx: &JobContext,
+            ) -> Result<ToolOutput, ToolExecError> {
+                self.called.store(true, Ordering::Relaxed);
+                Ok(ToolOutput::text(
+                    "recorded",
+                    std::time::Duration::from_millis(1),
+                ))
+            }
+            fn requires_sanitization(&self) -> bool {
+                false
+            }
+        }
+
+        let called = Arc::new(AtomicBool::new(false));
+        let worker = make_worker(vec![Arc::new(RecordTool {
+            called: called.clone(),
+        }) as Arc<dyn Tool>])
+        .await;
+        transition_worker_to_in_progress(&worker).await;
+
+        let outcome = execute_tool_batch(
+            &worker,
+            vec![
+                crate::llm::ToolCall {
+                    id: "call_other".to_string(),
+                    name: "record_tool".to_string(),
+                    arguments: serde_json::json!({}),
+                    reasoning: None,
+                },
+                finish_job_call("call_fj", "completed", Some("Mixed batch done")),
+            ],
+        )
+        .await
+        .map(|(outcome, _)| outcome)
+        .unwrap();
+
+        // record_tool must have executed
+        assert!(called.load(Ordering::Relaxed), "record_tool was not called"); // safety: test
+
+        assert_response_outcome(outcome, "Mixed batch done");
+
+        let ctx = worker
+            .context_manager()
+            .get_context(worker.job_id)
+            .await
+            .unwrap(); // safety: test
+        assert_eq!(ctx.state, JobState::Completed); // safety: test
+    }
+
+    /// If the model emits multiple finish_job calls, only the last call decides
+    /// the final state and summary, but every call still gets a tool result.
+    #[tokio::test]
+    async fn test_last_finish_job_call_wins() {
+        let worker = make_worker(vec![]).await;
+        transition_worker_to_in_progress(&worker).await;
+
+        let (outcome, reason_ctx) = execute_tool_batch(
+            &worker,
+            vec![
+                finish_job_call("call_finish_1", "failed", Some("stale failure")),
+                finish_job_call("call_finish_2", "completed", Some("latest completion")),
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(outcome, Some(LoopOutcome::Response(ref s)) if s == "latest completion"),
+            "the last finish_job call must decide the final outcome"
+        ); // safety: test
+
+        let tool_result_count = reason_ctx
+            .messages
+            .iter()
+            .filter(|msg| msg.role == crate::llm::Role::Tool)
+            .count();
+        assert_eq!(
+            tool_result_count, 2,
+            "every finish_job call should still emit a tool result"
+        ); // safety: test
+
+        let ctx = worker
+            .context_manager()
+            .get_context(worker.job_id)
+            .await
+            .unwrap(); // safety: test
+        assert_eq!(ctx.state, JobState::Completed); // safety: test
+    }
+
+    /// finish_job with status="failed" returns LoopOutcome::Failure (DB update by outer match).
+    #[tokio::test]
+    async fn test_finish_job_failed_status_returns_failure() {
+        let worker = make_worker(vec![]).await;
+        transition_worker_to_in_progress(&worker).await;
+
+        let outcome = execute_tool_batch(
+            &worker,
+            vec![finish_job_call(
+                "call_fail",
+                "failed",
+                Some("Could not reach the API"),
+            )],
+        )
+        .await
+        .map(|(outcome, _)| outcome)
+        .unwrap();
+
+        assert_failure_outcome(outcome, "Could not reach the API");
+    }
+
+    /// Blank failure summaries are normalized to a stable default message.
+    #[tokio::test]
+    async fn test_finish_job_blank_failed_summary_uses_default_message() {
+        let worker = make_worker(vec![]).await;
+        transition_worker_to_in_progress(&worker).await;
+
+        let outcome = execute_tool_batch(
+            &worker,
+            vec![finish_job_call("call_blank_failed", "failed", Some("   "))],
+        )
+        .await
+        .map(|(outcome, _)| outcome)
+        .unwrap();
+
+        assert_failure_outcome(outcome, "Job failed with no summary.");
+    }
+
+    /// Malformed finish_job parameters should behave like a normal tool error and let the loop continue.
+    #[tokio::test]
+    async fn test_finish_job_malformed_params_return_tool_error() {
+        let worker = make_worker(vec![]).await;
+        transition_worker_to_in_progress(&worker).await;
+
+        let (outcome, reason_ctx) = execute_tool_batch(
+            &worker,
+            vec![finish_job_call("call_bad_finish", "completed", None)],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            outcome.is_none(),
+            "malformed finish_job should return a recoverable tool error"
+        ); // safety: test
+        assert!(
+            reason_ctx.last_tool_batch_all_failed,
+            "malformed finish_job should count as a failed tool batch"
+        ); // safety: test
+
+        let tool_result_message = reason_ctx
+            .messages
+            .iter()
+            .find(|msg| msg.role == crate::llm::Role::Tool)
+            .map(|msg| msg.content.as_str())
+            .unwrap_or("");
+        assert!(
+            tool_result_message.contains("summary"),
+            "tool result should explain the malformed finish_job payload: {tool_result_message}"
+        ); // safety: test
+
+        let ctx = worker
+            .context_manager()
+            .get_context(worker.job_id)
+            .await
+            .unwrap(); // safety: test
+        assert_eq!(ctx.state, JobState::InProgress); // safety: test
     }
 }

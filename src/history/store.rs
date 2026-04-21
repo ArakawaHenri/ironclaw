@@ -1124,6 +1124,27 @@ pub struct JobEventRecord {
     pub created_at: DateTime<Utc>,
 }
 
+/// Extract the latest human-readable terminal message from persisted job events.
+///
+/// Job workers persist a terminal `"result"` event whose `data.message` carries
+/// the final user-facing summary. Returning the last such message lets callers
+/// recover a durable completion summary without overloading `failure_reason`.
+pub(crate) fn latest_job_result_message(events: &[JobEventRecord]) -> Option<String> {
+    events.iter().rev().find_map(|event| {
+        if event.event_type != "result" {
+            return None;
+        }
+
+        event.data.get("message").and_then(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map(ToOwned::to_owned)
+        })
+    })
+}
+
 #[cfg(feature = "postgres")]
 impl Store {
     /// Persist a job event (fire-and-forget from orchestrator handler).
