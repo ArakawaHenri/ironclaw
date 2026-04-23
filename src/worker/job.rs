@@ -272,7 +272,7 @@ impl Worker {
             .to_string();
 
         if let Some(store) = self.store() {
-            if let Err(e) = store
+            let result_event_saved = if let Err(e) = store
                 .save_job_event(self.job_id, "result", &result_payload)
                 .await
             {
@@ -284,8 +284,10 @@ impl Worker {
                     error = %e,
                     "Failed to persist finished worker result event"
                 );
-                return;
-            }
+                false
+            } else {
+                true
+            };
 
             if let Err(e) = store
                 .update_job_status(self.job_id, state, failure_reason)
@@ -295,9 +297,9 @@ impl Worker {
                     job_id = %self.job_id,
                     state = %state,
                     result_status = %result_status,
-                    result_event_saved = true,
+                    result_event_saved,
                     error = %e,
-                    "Failed to persist finished worker status after result event"
+                    "Failed to persist finished worker status after result event attempt"
                 );
                 return;
             }
@@ -2467,6 +2469,40 @@ mod tests {
                 .is_none(),
             "successful jobs must not populate failure_reason"
         );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_finish_job_still_persists_status_when_result_event_write_fails() {
+        let (db, tmp) = crate::testing::test_db().await;
+        let worker = make_worker_with_store(vec![], Arc::clone(&db)).await;
+        transition_worker_to_in_progress(&worker).await;
+
+        let raw_db = libsql::Builder::new_local(tmp.path().join("test.db"))
+            .build()
+            .await
+            .unwrap(); // safety: test
+        let conn = raw_db.connect().unwrap(); // safety: test
+        conn.execute("DROP TABLE job_events", ()).await.unwrap(); // safety: test
+
+        let summary = "Completed even though the result event could not be stored";
+        let outcome = execute_tool_batch(
+            &worker,
+            vec![finish_job_call("call_finish", "completed", Some(summary))],
+        )
+        .await
+        .map(|(outcome, _)| outcome)
+        .unwrap(); // safety: test
+
+        assert_response_outcome(outcome, summary);
+
+        let system_store = SystemScope::new(db);
+        let persisted_job = system_store
+            .get_job(worker.job_id)
+            .await
+            .unwrap() // safety: test
+            .expect("job should be persisted"); // safety: test
+        assert_eq!(persisted_job.state, JobState::Completed);
     }
 
     /// Build a Worker with the given approval context.
