@@ -1033,8 +1033,14 @@ or status \"failed\" when you hit an unresolvable blocker."#,
                 action.reasoning
             );
 
+            let tool_name = self
+                .tools()
+                .resolve_name_for_job(&action.tool_name)
+                .await
+                .unwrap_or_else(|| action.tool_name.clone());
+
             let selection = ToolSelection {
-                tool_name: action.tool_name.clone(),
+                tool_name: tool_name.clone(),
                 parameters: action.parameters.clone(),
                 reasoning: action.reasoning.clone(),
                 alternatives: vec![],
@@ -1057,9 +1063,7 @@ or status \"failed\" when you hit an unresolvable blocker."#,
                     }],
                 ));
 
-            let result = self
-                .execute_tool(&action.tool_name, &action.parameters)
-                .await;
+            let result = self.execute_tool(&tool_name, &action.parameters).await;
             let finish_signal_result = if selection.tool_name == "finish_job" {
                 finish_job_signal_from_result(&result)
             } else {
@@ -2003,12 +2007,18 @@ mod tests {
 
     struct PlanningFinishJobLlm {
         planning_prompt: StdMutex<Option<String>>,
+        tool_name: &'static str,
     }
 
     impl PlanningFinishJobLlm {
         fn new() -> Self {
+            Self::with_tool_name("finish_job")
+        }
+
+        fn with_tool_name(tool_name: &'static str) -> Self {
             Self {
                 planning_prompt: StdMutex::new(None),
+                tool_name,
             }
         }
 
@@ -2044,7 +2054,7 @@ mod tests {
                     "goal": "Finish the job cleanly",
                     "actions": [
                         {
-                            "tool_name": "finish_job",
+                            "tool_name": self.tool_name,
                             "parameters": {
                                 "status": "completed",
                                 "summary": "Planned completion"
@@ -2987,6 +2997,36 @@ mod tests {
             "planning prompt must not advertise finish_job: {planning_prompt}"
         ); // safety: test
 
+        let ctx = worker
+            .context_manager()
+            .get_context(worker.job_id)
+            .await
+            .unwrap(); // safety: test
+        assert_eq!(ctx.state, JobState::Completed); // safety: test
+    }
+
+    #[tokio::test]
+    async fn test_planning_finish_job_alias_terminates_loop() {
+        let llm = Arc::new(PlanningFinishJobLlm::with_tool_name("finish-job"));
+        let worker = make_worker_with_llm(vec![], llm, true).await;
+        transition_worker_to_in_progress(&worker).await;
+
+        let reasoning =
+            Reasoning::new(worker.llm().clone()).with_model_name(worker.llm().active_model_name());
+        let mut reason_ctx = ReasoningContext::new().with_job("test job");
+        let (_, mut rx) = tokio::sync::mpsc::channel(1);
+
+        let outcome = worker
+            .execution_loop(&mut rx, &reasoning, &mut reason_ctx)
+            .await
+            .unwrap(); // safety: test
+
+        match outcome {
+            LoopOutcome::Response(message) => {
+                assert_eq!(message, "Planned completion");
+            }
+            _ => panic!("planned finish_job alias should terminate successfully"),
+        }
         let ctx = worker
             .context_manager()
             .get_context(worker.job_id)
