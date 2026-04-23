@@ -1028,55 +1028,12 @@ mod tests {
 
     #[cfg(feature = "libsql")]
     fn test_gateway_state_with_store(store: Arc<dyn crate::db::Database>) -> Arc<GatewayState> {
-        Arc::new(GatewayState {
-            msg_tx: tokio::sync::RwLock::new(None),
-            sse: Arc::new(crate::channels::web::sse::SseManager::new()),
-            workspace: None,
-            workspace_pool: None,
-            session_manager: None,
-            log_broadcaster: None,
-            log_level_handle: None,
-            extension_manager: None,
-            tool_registry: None,
-            store: Some(store),
-            settings_cache: None,
-            job_manager: None,
-            prompt_queue: None,
-            owner_id: "alice".to_string(),
-            shutdown_tx: tokio::sync::RwLock::new(None),
-            ws_tracker: None,
-            llm_provider: None,
-            llm_reload: None,
-            llm_session_manager: None,
-            config_toml_path: None,
-            skill_registry: None,
-            skill_catalog: None,
-            auth_manager: None,
-            scheduler: None,
-            chat_rate_limiter: crate::channels::web::server::PerUserRateLimiter::new(30, 60),
-            oauth_rate_limiter: crate::channels::web::server::PerUserRateLimiter::new(20, 60),
-            webhook_rate_limiter: crate::channels::web::server::RateLimiter::new(10, 60),
-            registry_entries: vec![],
-            cost_guard: None,
-            routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
-            startup_time: std::time::Instant::now(),
-            active_config: Arc::new(tokio::sync::RwLock::new(
-                crate::channels::web::server::ActiveConfigSnapshot::default(),
-            )),
-            secrets_store: None,
-            db_auth: None,
-            pairing_store: None,
-            oauth_providers: None,
-            oauth_state_store: None,
-            oauth_base_url: None,
-            oauth_allowed_domains: Vec::new(),
-            near_nonce_store: None,
-            near_rpc_url: None,
-            near_network: None,
-            oauth_sweep_shutdown: None,
-            frontend_html_cache: Arc::new(tokio::sync::RwLock::new(None)),
-            tool_dispatcher: None,
-        })
+        crate::channels::web::test_helpers::test_gateway_state_with_dependencies(
+            None,
+            Some(store),
+            None,
+            None,
+        )
     }
 
     #[cfg(feature = "libsql")]
