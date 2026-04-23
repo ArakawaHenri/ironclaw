@@ -25,7 +25,7 @@ fn db_error(context: &str, e: impl std::fmt::Display) -> (StatusCode, String) {
     )
 }
 
-async fn latest_agent_result_event(
+async fn latest_job_result_event(
     store: &dyn crate::db::Database,
     job_id: Uuid,
 ) -> Option<crate::history::JobEventRecord> {
@@ -35,7 +35,7 @@ async fn latest_agent_result_event(
         .ok()?
 }
 
-fn agent_result_event_message(event: &crate::history::JobEventRecord) -> Option<String> {
+fn job_result_event_message(event: &crate::history::JobEventRecord) -> Option<String> {
     crate::history::job_result_event_message(event)
 }
 
@@ -264,6 +264,15 @@ pub async fn jobs_detail_handler(
                 let end = job.completed_at.unwrap_or_else(chrono::Utc::now);
                 (end - start).num_seconds().max(0) as u64
             });
+            let result_event = latest_job_result_event(store.as_ref(), job_id).await;
+            let terminal_reason = match job.status.as_str() {
+                "completed" => result_event.as_ref().and_then(job_result_event_message),
+                "failed" | "interrupted" => job
+                    .failure_reason
+                    .clone()
+                    .or_else(|| result_event.as_ref().and_then(job_result_event_message)),
+                _ => None,
+            };
 
             // Synthesize transitions from timestamps.
             let mut transitions = Vec::new();
@@ -280,7 +289,7 @@ pub async fn jobs_detail_handler(
                     from: "running".to_string(),
                     to: job.status.clone(),
                     timestamp: completed.to_rfc3339(),
-                    reason: job.failure_reason.clone(),
+                    reason: terminal_reason,
                 });
             }
 
@@ -320,7 +329,7 @@ pub async fn jobs_detail_handler(
             if !ctx.is_owned_by(&user.user_id) {
                 return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
             }
-            let result_event = latest_agent_result_event(store.as_ref(), job_id).await;
+            let result_event = latest_job_result_event(store.as_ref(), job_id).await;
             let completed_at = ctx
                 .completed_at
                 .or(result_event.as_ref().map(|event| event.created_at));
@@ -330,14 +339,14 @@ pub async fn jobs_detail_handler(
             });
             let terminal_reason = match ctx.state {
                 crate::context::JobState::Completed => {
-                    result_event.as_ref().and_then(agent_result_event_message)
+                    result_event.as_ref().and_then(job_result_event_message)
                 }
                 crate::context::JobState::Failed | crate::context::JobState::Cancelled => store
                     .get_agent_job_failure_reason(job_id)
                     .await
                     .ok()
                     .flatten()
-                    .or_else(|| result_event.as_ref().and_then(agent_result_event_message)),
+                    .or_else(|| result_event.as_ref().and_then(job_result_event_message)),
                 _ => None,
             };
 
@@ -1168,6 +1177,135 @@ mod tests {
         let jm = make_job_manager(false, false);
         let result = check_mode_enabled(JobMode::Worker, &jm);
         assert!(result.is_ok(), "worker mode should always be allowed");
+    }
+
+    #[cfg(feature = "libsql")]
+    fn sandbox_job_record(
+        id: Uuid,
+        status: &str,
+        failure_reason: Option<&str>,
+    ) -> crate::history::SandboxJobRecord {
+        let now = chrono::Utc::now();
+        crate::history::SandboxJobRecord {
+            id,
+            task: "Run sandbox task".to_string(),
+            status: status.to_string(),
+            user_id: "alice".to_string(),
+            project_dir: format!("/tmp/{id}"),
+            success: Some(status == "completed"),
+            failure_reason: failure_reason.map(ToOwned::to_owned),
+            created_at: now,
+            started_at: Some(now),
+            completed_at: Some(now),
+            credential_grants_json: "[]".to_string(),
+            mcp_servers: None,
+            max_iterations: None,
+        }
+    }
+
+    #[cfg(feature = "libsql")]
+    async fn fetch_job_detail(db: Arc<dyn crate::db::Database>, job_id: Uuid) -> JobDetailResponse {
+        let state = test_gateway_state_with_store(db);
+        jobs_detail_handler(
+            State(state),
+            AuthenticatedUser(crate::channels::web::platform::auth::UserIdentity {
+                user_id: "alice".to_string(),
+                role: "member".to_string(),
+                workspace_read_scopes: vec![],
+            }),
+            Path(job_id.to_string()),
+        )
+        .await
+        .unwrap() // safety: test
+        .0
+    }
+
+    #[cfg(feature = "libsql")]
+    async fn save_result_event(db: Arc<dyn crate::db::Database>, job_id: Uuid, message: &str) {
+        db.save_job_event(
+            job_id,
+            "result",
+            &serde_json::json!({
+                "status": "completed",
+                "success": true,
+                "message": message,
+            }),
+        )
+        .await
+        .unwrap(); // safety: test
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn jobs_detail_handler_surfaces_sandbox_completion_summary_from_result_event() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let job_id = Uuid::new_v4();
+        db.save_sandbox_job(&sandbox_job_record(job_id, "completed", None))
+            .await
+            .unwrap(); // safety: test
+        save_result_event(Arc::clone(&db), job_id, "Sandbox work complete").await;
+
+        let response = fetch_job_detail(Arc::clone(&db), job_id).await;
+
+        let final_transition = response
+            .transitions
+            .last()
+            .expect("completed sandbox job should have a terminal transition"); // safety: test
+        assert_eq!(final_transition.to, "completed");
+        assert_eq!(
+            final_transition.reason.as_deref(),
+            Some("Sandbox work complete")
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn jobs_detail_handler_prefers_sandbox_failure_reason_over_result_event() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let job_id = Uuid::new_v4();
+        db.save_sandbox_job(&sandbox_job_record(
+            job_id,
+            "failed",
+            Some("Container exited with code 1"),
+        ))
+        .await
+        .unwrap(); // safety: test
+        save_result_event(Arc::clone(&db), job_id, "Tool reported fallback summary").await;
+
+        let response = fetch_job_detail(Arc::clone(&db), job_id).await;
+
+        let final_transition = response
+            .transitions
+            .last()
+            .expect("failed sandbox job should have a terminal transition"); // safety: test
+        assert_eq!(final_transition.to, "failed");
+        assert_eq!(
+            final_transition.reason.as_deref(),
+            Some("Container exited with code 1")
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn jobs_detail_handler_falls_back_to_sandbox_result_event_for_interrupted_jobs() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let job_id = Uuid::new_v4();
+        db.save_sandbox_job(&sandbox_job_record(job_id, "interrupted", None))
+            .await
+            .unwrap(); // safety: test
+        save_result_event(Arc::clone(&db), job_id, "Sandbox interruption summary").await;
+
+        let response = fetch_job_detail(Arc::clone(&db), job_id).await;
+
+        let final_transition = response
+            .transitions
+            .last()
+            .expect("interrupted sandbox job should have a terminal transition"); // safety: test
+        assert_eq!(final_transition.to, "interrupted");
+        assert_eq!(
+            final_transition.reason.as_deref(),
+            Some("Sandbox interruption summary")
+        );
     }
 
     // --- Agent job transition synthesis -------------------------------------
