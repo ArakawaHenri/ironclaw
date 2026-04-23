@@ -260,11 +260,16 @@ pub async fn jobs_detail_handler(
                 s => s,
             };
 
+            let result_event = latest_job_result_event(store.as_ref(), job_id).await;
+            let completed_at = job.completed_at.or_else(|| {
+                matches!(job.status.as_str(), "completed" | "failed" | "interrupted")
+                    .then(|| result_event.as_ref().map(|event| event.created_at))
+                    .flatten()
+            });
             let elapsed_secs = job.started_at.map(|start| {
-                let end = job.completed_at.unwrap_or_else(chrono::Utc::now);
+                let end = completed_at.unwrap_or_else(chrono::Utc::now);
                 (end - start).num_seconds().max(0) as u64
             });
-            let result_event = latest_job_result_event(store.as_ref(), job_id).await;
             let terminal_reason = match job.status.as_str() {
                 "completed" => result_event.as_ref().and_then(job_result_event_message),
                 "failed" | "interrupted" => job
@@ -284,7 +289,7 @@ pub async fn jobs_detail_handler(
                     reason: None,
                 });
             }
-            if let Some(completed) = job.completed_at {
+            if let Some(completed) = completed_at {
                 transitions.push(TransitionInfo {
                     from: "running".to_string(),
                     to: job.status.clone(),
@@ -306,7 +311,7 @@ pub async fn jobs_detail_handler(
                 user_id: job.user_id.clone(),
                 created_at: job.created_at.to_rfc3339(),
                 started_at: job.started_at.map(|dt| dt.to_rfc3339()),
-                completed_at: job.completed_at.map(|dt| dt.to_rfc3339()),
+                completed_at: completed_at.map(|dt| dt.to_rfc3339()),
                 elapsed_secs,
                 project_dir: Some(job.project_dir.clone()),
                 browse_url: Some(format!("/projects/{}/", browse_id)),
@@ -1252,6 +1257,33 @@ mod tests {
             .last()
             .expect("completed sandbox job should have a terminal transition"); // safety: test
         assert_eq!(final_transition.to, "completed");
+        assert_eq!(
+            final_transition.reason.as_deref(),
+            Some("Sandbox work complete")
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn jobs_detail_handler_uses_sandbox_result_event_timestamp_when_completed_at_missing() {
+        let (db, _tmp) = crate::testing::test_db().await;
+        let job_id = Uuid::new_v4();
+        let mut job = sandbox_job_record(job_id, "completed", None);
+        job.completed_at = None;
+        db.save_sandbox_job(&job).await.unwrap(); // safety: test
+        save_result_event(Arc::clone(&db), job_id, "Sandbox work complete").await;
+
+        let response = fetch_job_detail(Arc::clone(&db), job_id).await;
+
+        let completed_at = response
+            .completed_at
+            .as_deref()
+            .expect("result event should provide sandbox completed_at fallback"); // safety: test
+        let final_transition = response
+            .transitions
+            .last()
+            .expect("result event timestamp should provide terminal transition"); // safety: test
+        assert_eq!(final_transition.timestamp, completed_at);
         assert_eq!(
             final_transition.reason.as_deref(),
             Some("Sandbox work complete")

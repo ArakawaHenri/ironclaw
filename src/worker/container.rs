@@ -484,6 +484,13 @@ impl LoopDelegate for ContainerDelegate {
             AutonomousRecoveryAction::Continue => {}
         }
 
+        // Empty text: do not auto-complete. Completion is only via finish_job.
+        // The agentic loop's max_iterations cap and nudge mechanism handle
+        // persistent empty responses.
+        if text.is_empty() {
+            return TextAction::Continue;
+        }
+
         self.post_event(
             "message",
             serde_json::json!({
@@ -493,13 +500,7 @@ impl LoopDelegate for ContainerDelegate {
         )
         .await;
 
-        // Empty text: do not auto-complete. Completion is only via finish_job.
-        // The agentic loop's max_iterations cap and nudge mechanism handle
-        // persistent empty responses.
-
-        if !text.is_empty() {
-            reason_ctx.messages.push(ChatMessage::assistant(text));
-        }
+        reason_ctx.messages.push(ChatMessage::assistant(text));
         TextAction::Continue
     }
 
