@@ -1734,26 +1734,34 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
             );
         }
 
-        // Add assistant message with tool_calls (OpenAI protocol)
-        reason_ctx
-            .messages
-            .push(ChatMessage::assistant_with_tool_calls(
-                content,
-                tool_calls.clone(),
-            ));
-
         // Partition: keep all non-finish_job calls first, then handle every
         // finish_job call at the end. If the model emits multiple finish_job
         // calls, only the last one decides the final status/summary.
         let mut finish_job_calls: Vec<crate::llm::ToolCall> = Vec::new();
         let mut other_calls: Vec<crate::llm::ToolCall> = Vec::with_capacity(tool_calls.len());
-        for tc in tool_calls {
-            if tc.name == "finish_job" {
+        for mut tc in tool_calls {
+            let resolved_name = self.worker.tools().resolve_name_for_job(&tc.name).await;
+            if resolved_name.as_deref() == Some("finish_job") {
+                tc.name = "finish_job".to_string();
                 finish_job_calls.push(tc);
             } else {
                 other_calls.push(tc);
             }
         }
+
+        let all_calls_for_msg: Vec<crate::llm::ToolCall> = other_calls
+            .iter()
+            .cloned()
+            .chain(finish_job_calls.iter().cloned())
+            .collect();
+
+        // Add assistant message with tool_calls (OpenAI protocol)
+        reason_ctx
+            .messages
+            .push(ChatMessage::assistant_with_tool_calls(
+                content,
+                all_calls_for_msg,
+            ));
 
         // Convert non-finish_job calls to ToolSelections and execute.
         let selections: Vec<ToolSelection> = other_calls
@@ -2170,7 +2178,12 @@ mod tests {
         }
     }
 
-    fn finish_job_call(id: &str, status: &str, summary: Option<&str>) -> crate::llm::ToolCall {
+    fn finish_job_call_named(
+        name: &str,
+        id: &str,
+        status: &str,
+        summary: Option<&str>,
+    ) -> crate::llm::ToolCall {
         let arguments = match summary {
             Some(summary) => serde_json::json!({
                 "status": status,
@@ -2183,10 +2196,14 @@ mod tests {
 
         crate::llm::ToolCall {
             id: id.to_string(),
-            name: "finish_job".to_string(),
+            name: name.to_string(),
             arguments,
             reasoning: None,
         }
+    }
+
+    fn finish_job_call(id: &str, status: &str, summary: Option<&str>) -> crate::llm::ToolCall {
+        finish_job_call_named("finish_job", id, status, summary)
     }
 
     async fn execute_tool_batch(
@@ -2856,6 +2873,35 @@ mod tests {
                 .and_then(|transition| transition.reason.as_deref()),
             Some("All tasks done")
         ); // safety: test
+    }
+
+    /// finish_job aliases terminate the loop instead of being handled as ordinary tools.
+    #[tokio::test]
+    async fn test_finish_job_hyphen_alias_terminates_loop() {
+        let worker = make_worker(vec![]).await;
+        transition_worker_to_in_progress(&worker).await;
+
+        let outcome = execute_tool_batch(
+            &worker,
+            vec![finish_job_call_named(
+                "finish-job",
+                "call_alias",
+                "completed",
+                Some("Alias completion"),
+            )],
+        )
+        .await
+        .map(|(outcome, _)| outcome)
+        .unwrap();
+
+        assert_response_outcome(outcome, "Alias completion");
+
+        let ctx = worker
+            .context_manager()
+            .get_context(worker.job_id)
+            .await
+            .unwrap(); // safety: test
+        assert_eq!(ctx.state, JobState::Completed); // safety: test
     }
 
     /// Blank completion summaries are normalized to a stable default message.

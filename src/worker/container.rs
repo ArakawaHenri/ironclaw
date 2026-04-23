@@ -519,8 +519,10 @@ impl LoopDelegate for ContainerDelegate {
         // calls, only the last one decides the final status/summary.
         let mut finish_job_calls: Vec<crate::llm::ToolCall> = Vec::new();
         let mut other_calls: Vec<crate::llm::ToolCall> = Vec::with_capacity(tool_calls.len());
-        for tc in tool_calls {
-            if tc.name == "finish_job" {
+        for mut tc in tool_calls {
+            let resolved_name = self.tools.resolve_name_for_job(&tc.name).await;
+            if resolved_name.as_deref() == Some("finish_job") {
+                tc.name = "finish_job".to_string();
                 finish_job_calls.push(tc);
             } else {
                 other_calls.push(tc);
