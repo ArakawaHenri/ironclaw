@@ -261,10 +261,10 @@ impl Worker {
     /// Publish a finished worker outcome without turning persistence failures
     /// into execution failures.
     ///
-    /// The durable result event is written before the finished status becomes
-    /// visible, so readers that observe the status can immediately fetch the
-    /// final result message. Ordinary events intentionally keep the cheaper
-    /// fire-and-forget path.
+    /// The durable result event and finished status are committed together, so
+    /// readers that observe the status can immediately fetch the final result
+    /// message. Ordinary events intentionally keep the cheaper fire-and-forget
+    /// path.
     async fn publish_final_result(
         &self,
         state: JobState,
@@ -277,23 +277,18 @@ impl Worker {
             .unwrap_or("unknown")
             .to_string();
 
-        if let Some(store) = self.store() {
-            let result_event_saved = if let Err(e) = store
-                .save_job_event(self.job_id, "result", &result_payload)
+        if let Some(store) = self.store()
+            && let Err(e) = store
+                .record_job_terminal_result(self.job_id, state, failure_reason, &result_payload)
                 .await
-            {
-                tracing::warn!(
-                    job_id = %self.job_id,
-                    state = %state,
-                    result_status = %result_status,
-                    result_event_saved = false,
-                    error = %e,
-                    "Failed to persist finished worker result event"
-                );
-                false
-            } else {
-                true
-            };
+        {
+            tracing::warn!(
+                job_id = %self.job_id,
+                state = %state,
+                result_status = %result_status,
+                error = %e,
+                "Failed to atomically persist finished worker result and status"
+            );
 
             if let Err(e) = store
                 .update_job_status(self.job_id, state, failure_reason)
@@ -303,9 +298,8 @@ impl Worker {
                     job_id = %self.job_id,
                     state = %state,
                     result_status = %result_status,
-                    result_event_saved,
                     error = %e,
-                    "Failed to persist finished worker status after result event attempt"
+                    "Failed to persist finished worker status after atomic result failure"
                 );
                 return;
             }

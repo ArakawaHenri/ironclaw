@@ -354,6 +354,44 @@ impl Store {
         Ok(())
     }
 
+    /// Atomically persist a terminal result event and matching job status.
+    pub async fn record_job_terminal_result(
+        &self,
+        id: Uuid,
+        status: JobState,
+        failure_reason: Option<&str>,
+        result_payload: &serde_json::Value,
+    ) -> Result<(), DatabaseError> {
+        let mut conn = self.conn().await?;
+        let tx = conn.transaction().await?;
+
+        let status_str = status.to_string();
+        let updated = tx
+            .execute(
+                "UPDATE agent_jobs SET status = $2, failure_reason = $3 WHERE id = $1",
+                &[&id, &status_str, &failure_reason],
+            )
+            .await?;
+        if updated == 0 {
+            return Err(DatabaseError::NotFound {
+                entity: "job".to_string(),
+                id: id.to_string(),
+            });
+        }
+
+        tx.execute(
+            r#"
+            INSERT INTO job_events (job_id, event_type, data)
+            VALUES ($1, 'result', $2)
+            "#,
+            &[&id, result_payload],
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Mark job as stuck.
     pub async fn mark_job_stuck(&self, id: Uuid) -> Result<(), DatabaseError> {
         let conn = self.conn().await?;

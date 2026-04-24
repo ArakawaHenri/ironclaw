@@ -845,6 +845,18 @@ impl SystemScope {
             .await
     }
 
+    pub async fn record_job_terminal_result(
+        &self,
+        id: Uuid,
+        status: JobState,
+        failure_reason: Option<&str>,
+        result_payload: &serde_json::Value,
+    ) -> Result<(), DatabaseError> {
+        self.inner
+            .record_job_terminal_result(id, status, failure_reason, result_payload)
+            .await
+    }
+
     pub async fn mark_job_stuck(&self, id: Uuid) -> Result<(), DatabaseError> {
         self.inner.mark_job_stuck(id).await
     }

@@ -504,6 +504,16 @@ pub trait JobStore: Send + Sync {
         status: JobState,
         failure_reason: Option<&str>,
     ) -> Result<(), DatabaseError>;
+    /// Atomically persist a terminal agent-job result event and the matching
+    /// terminal status row. Readers that observe the terminal status must be
+    /// able to fetch the result event in the same committed DB snapshot.
+    async fn record_job_terminal_result(
+        &self,
+        id: Uuid,
+        status: JobState,
+        failure_reason: Option<&str>,
+        result_payload: &serde_json::Value,
+    ) -> Result<(), DatabaseError>;
     async fn mark_job_stuck(&self, id: Uuid) -> Result<(), DatabaseError>;
     async fn get_stuck_jobs(&self) -> Result<Vec<Uuid>, DatabaseError>;
     async fn list_agent_jobs(&self) -> Result<Vec<AgentJobRecord>, DatabaseError>;
