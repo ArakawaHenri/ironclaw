@@ -265,7 +265,7 @@ impl Worker {
     /// visible, so readers that observe the status can immediately fetch the
     /// final result message. Ordinary events intentionally keep the cheaper
     /// fire-and-forget path.
-    async fn publish_terminal_outcome_best_effort(
+    async fn publish_final_result(
         &self,
         state: JobState,
         failure_reason: Option<&str>,
@@ -1132,7 +1132,7 @@ or status \"failed\" when you hit an unresolvable blocker."#,
                 reason: s,
             })?;
 
-        self.publish_terminal_outcome_best_effort(
+        self.publish_final_result(
             JobState::Completed,
             None,
             serde_json::json!({
@@ -1162,7 +1162,7 @@ or status \"failed\" when you hit an unresolvable blocker."#,
                 reason: s,
             })?;
 
-        self.publish_terminal_outcome_best_effort(
+        self.publish_final_result(
             JobState::Failed,
             Some(reason),
             serde_json::json!({
@@ -1193,7 +1193,7 @@ or status \"failed\" when you hit an unresolvable blocker."#,
 
         // Emit via the typed enum so the wire string stays in sync with
         // `JobResultStatus::Stuck::as_str()` — no string-literal drift.
-        self.publish_terminal_outcome_best_effort(
+        self.publish_final_result(
             JobState::Stuck,
             Some(reason),
             serde_json::json!({
